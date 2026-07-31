@@ -5,7 +5,9 @@ use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::builtin;
-use crate::config::{Config, MAX_PROMPT_BYTES, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_RESULT_BYTES};
+use crate::config::{
+    pricing_authority, Config, MAX_PROMPT_BYTES, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_RESULT_BYTES,
+};
 use crate::handoff::HandoffOutcome;
 use crate::hints::SkillEntry;
 use crate::llm::Llm;
@@ -13,8 +15,8 @@ use crate::mcp::McpRegistry;
 use crate::mcp::ResultBudget;
 
 use crate::types::{
-    AgentError, ContentBlock, HistoryItem, ProviderStop, SessionUsageBaseline, StopReason,
-    ToolCall, ToolResult, ToolResultContent, TurnTotalState,
+    AgentError, ContentBlock, HistoryItem, PricingIdentity, ProviderStop, SessionUsageBaseline,
+    StopReason, ToolCall, ToolResult, ToolResultContent, TurnTotalState,
 };
 use crate::wire::{self, WireSender};
 
@@ -139,6 +141,23 @@ pub struct RunCtx<'a> {
     /// Consumers price this slice at the provider's cached rate; without it
     /// every round of a growing conversation is billed at full price.
     pub turn_cached_input_tokens: &'a mut Option<u64>,
+    /// The cache-written subset of `turn_input_tokens`, accumulated across all
+    /// LLM rounds in this turn. Reset to `None` at turn start in `run()`.
+    /// Consumers need this to price cache-creation at the provider's write rate
+    /// (distinct from both the standard input rate and the cached-read rate).
+    pub turn_cache_write_tokens: &'a mut Option<u64>,
+    /// Per-turn billing identity accumulator.
+    ///
+    /// - `None`: no usage-bearing response observed yet this turn (initial state).
+    /// - `Some(Some(pi))`: all usage-bearing responses so far carry the same
+    ///   proven identity `pi`. If a subsequent response carries a different or
+    ///   unproven identity, this transitions to `Some(None)` (poisoned).
+    /// - `Some(None)`: poisoned — mixed identities, unproven response, mesh
+    ///   retry across models, or no identity derived. Never heals within the turn.
+    ///
+    /// Reset to `None` at turn start in `run()`. The wire payload emits the
+    /// proven identity when `Some(Some(pi))`, omits it otherwise.
+    pub turn_pricing_identity: &'a mut Option<Option<PricingIdentity>>,
     /// Tri-state total-token accumulator for this turn.
     ///
     /// - `Unseen`: no usage-bearing response observed yet this turn (initial state).
@@ -156,6 +175,59 @@ pub struct RunCtx<'a> {
     pub usage_baseline: SessionUsageBaseline,
 }
 
+/// Combine a session-baseline Optional counter with a per-turn Optional delta
+/// into a session-cumulative Optional.
+///
+/// Rules:
+/// - Both None → None (this category was never observed for this session).
+/// - Either Some → Some(baseline.unwrap_or(0) + turn.unwrap_or(0)).
+///
+/// This ensures that a single observed value promotes the accumulator out of
+/// the "never seen" state, while keeping None meaningful as "unknown/absent"
+/// throughout the session when neither side ever reports the field.
+#[inline]
+fn combine_optional_accumulator(baseline: Option<u64>, turn: Option<u64>) -> Option<u64> {
+    match (baseline, turn) {
+        (None, None) => None,
+        _ => Some(baseline.unwrap_or(0).saturating_add(turn.unwrap_or(0))),
+    }
+}
+
+/// Fold one round's proven identity into the per-turn identity accumulator.
+///
+/// Accumulator tri-state (NIP-AM §pricingIdentity):
+/// - `None`: no usage-bearing round observed yet this turn.
+/// - `Some(Some(pi))`: every usage-bearing round so far carries the same
+///   proven identity `pi`.
+/// - `Some(None)`: poisoned — mixed identities or unproven round seen.
+///   Never heals within the turn.
+///
+/// `round`: `Some(pi)` when this round's `(base_url, request_model)` resolve
+/// to a proven identity; `None` when the endpoint is unallowlisted or the
+/// model is unknown.
+#[inline]
+fn fold_pricing_identity(
+    acc: Option<Option<PricingIdentity>>,
+    round: Option<PricingIdentity>,
+) -> Option<Option<PricingIdentity>> {
+    match acc {
+        // First usage-bearing round: record whatever was derived.
+        None => Some(round),
+        // Already consistent: keep only if this round matches exactly.
+        Some(Some(ref existing)) => {
+            if Some(existing) == round.as_ref() {
+                Some(round)
+            } else {
+                // Mismatch (different model, different authority,
+                // or this round had no proven identity) → poison.
+                Some(None)
+            }
+        }
+        // Already poisoned: stays poisoned forever this turn.
+        poisoned @ Some(None) => poisoned,
+    }
+}
+
 impl RunCtx<'_> {
     /// Send a session-cumulative `usage_update` reflecting everything observed
     /// up to and including the most recent LLM response.
@@ -167,15 +239,26 @@ impl RunCtx<'_> {
     /// everything but its final in-flight request.
     async fn emit_usage_update(&self) {
         let base = self.usage_baseline;
+        // Combine session baseline (Option<u64>) with the current turn delta
+        // (Option<u64>): if either is Some, we have an observation. The wire
+        // payload takes Option — absent means "never seen this session".
+        let cached_total =
+            combine_optional_accumulator(base.cached_input_tokens, *self.turn_cached_input_tokens);
+        let write_total =
+            combine_optional_accumulator(base.cache_write_tokens, *self.turn_cache_write_tokens);
         let payload = wire::usage_update_payload(
             base.input_tokens
                 .saturating_add(self.turn_input_tokens.unwrap_or(0)),
             base.output_tokens
                 .saturating_add(self.turn_output_tokens.unwrap_or(0)),
-            base.cached_input_tokens
-                .saturating_add(self.turn_cached_input_tokens.unwrap_or(0)),
+            cached_total,
+            write_total,
             base.total_state.merge_session(*self.turn_total_state),
             self.effective_model,
+            // Extract the proven identity if this turn is consistent so far.
+            self.turn_pricing_identity
+                .as_ref()
+                .and_then(|inner| inner.as_ref()),
         );
         wire::send(
             self.wire,
@@ -200,6 +283,8 @@ impl RunCtx<'_> {
         *self.turn_input_tokens = None;
         *self.turn_output_tokens = None;
         *self.turn_cached_input_tokens = None;
+        *self.turn_cache_write_tokens = None;
+        *self.turn_pricing_identity = None;
         *self.turn_total_state = TurnTotalState::Unseen;
 
         let mut round = 0u32;
@@ -317,10 +402,22 @@ impl RunCtx<'_> {
                         .saturating_add(cached),
                 );
             }
-            // Fold the provider-reported total into the turn tri-state, but only
-            // when this response was usage-bearing (had input or output tokens).
+            // Accumulate the cache-written subset of this turn's input.
+            // Tracked separately for the same reason as cache-read: the input
+            // total must remain inclusive, and a consumer prices cache-creation
+            // at a different rate than either standard input or cache-read.
+            if let Some(written) = response.cache_write_tokens {
+                *self.turn_cache_write_tokens = Some(
+                    self.turn_cache_write_tokens
+                        .unwrap_or(0)
+                        .saturating_add(written),
+                );
+            }
+            // Fold the provider-reported total into the turn tri-state, and
+            // accumulate billing identity — only when this response was
+            // usage-bearing (had input or output tokens).
             // A response with no usage at all is not evidence of a missing total
-            // and must not poison the accumulator.
+            // and must not poison either accumulator.
             //
             // Shape assumption: documented OpenAI-compatible responses that carry
             // `total_tokens` always co-report at least one of `prompt_tokens` /
@@ -330,6 +427,32 @@ impl RunCtx<'_> {
             // this gate rather than representing absent categories as zero.
             if response.input_tokens.is_some() || response.output_tokens.is_some() {
                 *self.turn_total_state = self.turn_total_state.fold(response.total_tokens);
+
+                // Derive billing identity for this round and fold it into the
+                // per-turn accumulator.  Rules (NIP-AM §pricingIdentity):
+                //
+                // 1. Attempt to derive identity from (base_url, request_model).
+                //    - base_url must canonically match an official allowlisted host.
+                //    - request_model must be Some (mesh-auto with unknown model
+                //      cannot prove identity).
+                // 2. Fold the round identity into the turn accumulator:
+                //    - Unseen (None): record this round's identity (or poison if None).
+                //    - Consistent: if it matches, keep; otherwise poison.
+                //    - Poisoned: stays poisoned forever this turn.
+                {
+                    let round_identity: Option<PricingIdentity> =
+                        response.request_model.as_deref().and_then(|model| {
+                            pricing_authority(&self.cfg.base_url).map(|auth| PricingIdentity {
+                                authority: auth.to_string(),
+                                model: model.to_string(),
+                                cache_class: None, // no cache-class derivation yet
+                            })
+                        });
+
+                    *self.turn_pricing_identity =
+                        fold_pricing_identity(self.turn_pricing_identity.take(), round_identity);
+                }
+
                 // Report what the turn has burned SO FAR, before running the
                 // next round. A turn is many provider round-trips over many
                 // minutes, and until this point the only report was the one
@@ -1091,6 +1214,101 @@ mod tests {
             history.len(),
             original_len,
             "under budget must not evict anything"
+        );
+    }
+
+    // ── fold_pricing_identity: turn discipline ────────────────────────────────
+
+    fn pi(authority: &str, model: &str) -> PricingIdentity {
+        PricingIdentity {
+            authority: authority.to_string(),
+            model: model.to_string(),
+            cache_class: None,
+        }
+    }
+
+    /// Case 1: two usage-bearing rounds with different proven identities in one
+    /// turn must poison the accumulator.  The wire payload omits `pricingIdentity`
+    /// when `Some(None)`.
+    #[test]
+    fn fold_pricing_identity_mismatch_poisons() {
+        let round_a = Some(pi("api.anthropic.com", "claude-opus-4-5"));
+        let round_b = Some(pi("api.openai.com", "gpt-4o"));
+
+        // Start: unseen.
+        let acc = None;
+        // After round A: consistent — Some(Some(claude-opus-4-5)).
+        let acc = fold_pricing_identity(acc, round_a);
+        assert!(
+            matches!(acc, Some(Some(_))),
+            "after one round must be consistent"
+        );
+        // After round B (different authority + model): poisoned.
+        let acc = fold_pricing_identity(acc, round_b);
+        assert_eq!(
+            acc,
+            Some(None),
+            "different proven identities in one turn must poison"
+        );
+    }
+
+    /// Case 2: proven identity followed by a usage-bearing round with no proven
+    /// identity (request_model absent or non-allowlisted endpoint) must poison.
+    /// An unpaired cumulative snapshot also produces round=None (no model known)
+    /// and hits this same path — case 4 collapses into case 2.
+    #[test]
+    fn fold_pricing_identity_unproven_round_poisons() {
+        let round_a = Some(pi("api.anthropic.com", "claude-3-7-sonnet"));
+        let round_unproven: Option<PricingIdentity> = None; // absent request_model or custom endpoint
+
+        let acc = None;
+        let acc = fold_pricing_identity(acc, round_a);
+        assert!(
+            matches!(acc, Some(Some(_))),
+            "after one proven round must be consistent"
+        );
+        let acc = fold_pricing_identity(acc, round_unproven);
+        assert_eq!(
+            acc,
+            Some(None),
+            "an unproven round after a proven round must poison (no-model / custom-endpoint path)"
+        );
+    }
+
+    /// Case 3: a poisoned accumulator must not heal, even if a later round
+    /// carries an identity matching the original.
+    #[test]
+    fn fold_pricing_identity_poisoned_never_heals() {
+        let round_a = Some(pi("api.openai.com", "gpt-4o"));
+        let round_unproven: Option<PricingIdentity> = None;
+        let round_a_again = Some(pi("api.openai.com", "gpt-4o")); // identical to round_a
+
+        let acc = None;
+        let acc = fold_pricing_identity(acc, round_a);
+        let acc = fold_pricing_identity(acc, round_unproven); // poisons
+        assert_eq!(acc, Some(None), "must be poisoned before heal attempt");
+        let acc = fold_pricing_identity(acc, round_a_again); // must not heal
+        assert_eq!(
+            acc,
+            Some(None),
+            "poisoned accumulator must stay poisoned even when the next round matches the original identity"
+        );
+    }
+
+    /// Baseline: a turn where every round carries the same proven identity
+    /// stays consistent and emits the identity on the wire.
+    #[test]
+    fn fold_pricing_identity_consistent_rounds_stay_proven() {
+        let identity = pi("api.openrouter.ai", "meta-llama/llama-4-scout");
+
+        let acc = None;
+        let acc = fold_pricing_identity(acc, Some(identity.clone()));
+        let acc = fold_pricing_identity(acc, Some(identity.clone()));
+        let acc = fold_pricing_identity(acc, Some(identity.clone()));
+        assert_eq!(
+            acc,
+            Some(Some(identity)),
+            "three identical rounds must remain consistently proven"
         );
     }
 }

@@ -178,6 +178,15 @@ pub struct LlmResponse {
     /// provider we speak to reports an inclusive input total, so adding this
     /// would double-count.
     pub cached_input_tokens: Option<u64>,
+    /// The portion of `input_tokens` the provider consumed to WRITE to its
+    /// prompt cache (i.e. cache-creation tokens), or `None` when the provider
+    /// did not report a cache-write split.
+    ///
+    /// This is also a subset of `input_tokens`, not an addition. On Anthropic
+    /// this is `cache_creation_input_tokens`; on OpenAI Chat it is
+    /// `prompt_tokens_details.cache_write_tokens`. The Responses API does not
+    /// expose this field today — it stays `None` for that route.
+    pub cache_write_tokens: Option<u64>,
     /// Output tokens the provider reported for this request, or `None` if the
     /// response carried no usage. Used to accumulate per-turn output counts
     /// for NIP-AM metric publishing.
@@ -202,6 +211,32 @@ pub struct LlmResponse {
     /// Replayed on subsequent turns so the model can continue its chain-of-thought.
     /// `None` for all non-OpenRouter providers.
     pub reasoning_details: Option<Value>,
+    /// The model id that was actually sent in the request body — the
+    /// actually-requested model after any auto/mesh resolution. Populated by
+    /// the LLM dispatch layer, not the JSON parser. `None` only for routes
+    /// where the model is unknown or irrelevant (should not occur in practice).
+    ///
+    /// Used by the usage accumulation path to stamp `pricingIdentity.model`;
+    /// distinct from `effective_model`, which is the configured/session model.
+    pub request_model: Option<String>,
+}
+
+/// Publisher-side billing identity for a turn.
+///
+/// Mirrors `buzz_core::agent_turn_metric::PricingIdentity` but is local to
+/// `buzz-agent` (which does not depend on `buzz-core`). The two structs have
+/// the same camelCase wire representation and are deserialized identically by
+/// `buzz-acp`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingIdentity {
+    /// Registered billing-namespace identifier (bare lowercase hostname).
+    pub authority: String,
+    /// Actually-requested billable model identifier.
+    pub model: String,
+    /// Cache-write class when applicable; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_class: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -328,7 +363,11 @@ pub struct SessionUsageBaseline {
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// The cache-served subset of `input_tokens`, not an addition to it.
-    pub cached_input_tokens: u64,
+    /// `None` when the session has never observed a cache-read value.
+    pub cached_input_tokens: Option<u64>,
+    /// The cache-written subset of `input_tokens`, not an addition to it.
+    /// `None` when the session has never observed a cache-write value.
+    pub cache_write_tokens: Option<u64>,
     pub total_state: TurnTotalState,
 }
 
