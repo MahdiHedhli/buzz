@@ -47,6 +47,22 @@ pub(crate) struct KnownAcpRuntime {
     pub config_file_format: Option<&'static str>,
     pub supports_acp_native_config: bool, // tier 1a: config/read+write
     pub thinking_env_var: Option<&'static str>,
+    /// Accepted values for `thinking_env_var` on this harness.
+    ///
+    /// `Some(set)` — only values in this slice are valid; an absent or invalid
+    /// value degrades to the harness default. The single authority for UI
+    /// choices, spawn bridge, and reader validity checks.
+    ///
+    /// `None` — harness does not define a finite accepted-value set (e.g.
+    /// buzz-agent accepts any provider/model-specific value via its own
+    /// per-model catalog). See `getProviderEffortConfig()` in TS for that path.
+    ///
+    /// Source for Goose: `crates/goose-provider-types/src/thinking.rs` `FromStr`
+    /// (case-insensitive): `off|disabled|none`, `low`, `medium|med`, `high`,
+    /// `max|xhigh`. We store the canonical UI aliases the user would type and
+    /// what we write/read: `[none, low, medium, high, xhigh, max]`. `minimal`
+    /// is buzz-agent-specific and is intentionally absent.
+    pub accepted_effort_values: Option<&'static [&'static str]>,
     /// Env var for normalizing `max_output_tokens`. `None` when the harness
     /// does not have a first-class env var for this field (config-file only).
     pub max_tokens_env_var: Option<&'static str>,

@@ -645,6 +645,9 @@ pub struct AcpRuntimeCatalogEntry {
     pub provider_env_var: Option<String>,
     /// Environment variable used to apply thinking effort, when supported.
     pub thinking_env_var: Option<String>,
+    /// Accepted effort values; `None` = per-model catalog (buzz-agent only), `Some` = harness-static.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_effort_values: Option<Vec<String>>,
     pub install_hint: String,
     pub install_instructions_url: String,
     /// true when at least one automated install step is available
@@ -916,18 +919,12 @@ pub struct MintBehavioralDefaults {
     pub parallelism: Option<u32>,
 }
 
-/// Resolve the NIP-AP behavioral quad for a new instance: explicit input
-/// wins, then the linked definition's defaults, then client defaults.
+/// Resolve the NIP-AP behavioral quad for a new instance: explicit input wins,
+/// then the linked definition's defaults, then client defaults.
 ///
-/// This is the ONLY place definition behavioral strings are parsed — an
-/// unrecognized `respond_to` mode or out-of-range `parallelism` on a
-/// definition fails the mint loudly instead of silently substituting a
-/// default the definition author did not choose. The empty-allowlist guard
-/// fires here too, because inbound definitions bypass the dialog entirely.
-///
-/// `input_allowlist` must already be normalized via
-/// [`validate_respond_to_allowlist`]; the definition's allowlist is
-/// validated here since it arrives from the wire.
+/// Definition behavioral strings are parsed here only — unrecognized values fail loudly.
+/// `input_allowlist` must already be normalized via [`validate_respond_to_allowlist`];
+/// the definition's allowlist is validated here since it arrives from the wire.
 pub fn resolve_mint_behavioral_defaults(
     input_respond_to: Option<RespondTo>,
     input_allowlist: Vec<String>,

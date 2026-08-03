@@ -61,9 +61,7 @@ fn common_binary_paths() -> &'static [PathBuf] {
                         .join("bin"),
                 );
             }
-            // Goose's legacy Windows installer (superseded by #2680) unpacked
-            // to %USERPROFILE%\goose\goose.exe, which is on no standard PATH —
-            // without this probe those installs stay permanently undiscovered.
+            // Goose's legacy Windows installer (#2680) placed goose.exe in %USERPROFILE%\goose.
             if let Some(profile) = std::env::var_os("USERPROFILE") {
                 paths.push(PathBuf::from(profile).join("goose"));
             }
@@ -83,8 +81,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         mcp_hooks: false,
         underlying_cli: Some("goose"),
         cli_install_commands: &["curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash"],
-        // Goose's stable release currently publishes only the Unix installer;
-        // its official Windows instructions intentionally point at this main-branch script.
+        // Goose's stable release publishes only the Unix installer; Windows uses the main-branch script.
         cli_install_commands_windows: &[windows_install_command!("goose", "https://raw.githubusercontent.com/aaif-goose/goose/main/download_cli.ps1", "$env:CONFIGURE='false'; ")],
         adapter_install_commands: &[],
         cli_install_instructions_url: "https://goose-docs.ai/docs/getting-started/installation/",
@@ -101,6 +98,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         config_file_format: Some("yaml"),
         supports_acp_native_config: true,
         thinking_env_var: Some("GOOSE_THINKING_EFFORT"),
+        accepted_effort_values: Some(&["none", "low", "medium", "high", "xhigh", "max"]),
         max_tokens_env_var: Some("GOOSE_MAX_TOKENS"),
         context_limit_env_var: Some("GOOSE_CONTEXT_LIMIT"),
         required_normalized_fields: &["model", "provider"],
@@ -133,6 +131,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         config_file_format: Some("json"),
         supports_acp_native_config: false,
         thinking_env_var: None,
+        accepted_effort_values: None,
         max_tokens_env_var: None,
         context_limit_env_var: None,
         required_normalized_fields: &[],
@@ -165,6 +164,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         config_file_format: Some("toml"),
         supports_acp_native_config: false,
         thinking_env_var: None,
+        accepted_effort_values: None,
         max_tokens_env_var: None,
         context_limit_env_var: None,
         required_normalized_fields: &[],
@@ -198,6 +198,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         config_file_format: None,
         supports_acp_native_config: false,
         thinking_env_var: Some("BUZZ_AGENT_THINKING_EFFORT"),
+        accepted_effort_values: None, // None → per-model catalog; see getProviderEffortConfig() in TS
         max_tokens_env_var: Some("BUZZ_AGENT_MAX_OUTPUT_TOKENS"),
         context_limit_env_var: Some("BUZZ_AGENT_MAX_CONTEXT_TOKENS"),
         required_normalized_fields: &["model", "provider"],
@@ -275,14 +276,9 @@ pub(crate) fn known_acp_runtime_exact(id: &str) -> Option<&'static KnownAcpRunti
     KNOWN_ACP_RUNTIMES.iter().find(|p| p.id == id)
 }
 
-/// The agent command a freshly-created agent defaults to when the create
-/// request supplies none. Resolves the bundled `buzz-agent` from the catalog so
-/// the default cannot drift from the provider definition. Falls back to the id
-/// if the catalog entry is missing.
-///
-/// The previous default was the bare global `goose`, which is not on PATH on a
-/// stock Windows install: every worker failed with `program not found`. The
-/// bundled `buzz-agent` ships with the app and resolves on every platform.
+/// The agent command a freshly-created agent defaults to when the create request supplies none.
+/// Resolves the bundled `buzz-agent` from the catalog (falls back to the id string if missing).
+/// The bundled binary ships with the app; the former global `goose` was not on PATH on Windows.
 pub fn default_agent_command() -> String {
     known_acp_runtime_exact("buzz-agent")
         .and_then(|p| p.commands.first().copied())
@@ -1413,6 +1409,9 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime) -> PartialEntr
             model_env_var: runtime.model_env_var.map(str::to_string),
             provider_env_var: runtime.provider_env_var.map(str::to_string),
             thinking_env_var: runtime.thinking_env_var.map(str::to_string),
+            accepted_effort_values: runtime
+                .accepted_effort_values
+                .map(|vs| vs.iter().map(|v| v.to_string()).collect()),
             install_hint,
             install_instructions_url: install_instructions_url.to_string(),
             can_auto_install,
@@ -1571,6 +1570,7 @@ pub fn discover_acp_runtimes_from(
                 model_env_var: None,
                 provider_env_var: None,
                 thinking_env_var: None,
+                accepted_effort_values: None,
                 install_hint: def.install_hint.clone(),
                 install_instructions_url: def.install_instructions_url.clone(),
                 // Security line: custom definitions carry no install scripts.

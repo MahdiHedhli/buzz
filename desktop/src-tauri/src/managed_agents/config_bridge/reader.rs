@@ -35,6 +35,7 @@ pub(crate) fn read_config_surface(
     let provider_env_var = runtime_meta.and_then(|m| m.provider_env_var);
     let provider_locked = runtime_meta.is_some_and(|m| m.provider_locked);
     let thinking_env_var = runtime_meta.and_then(|m| m.thinking_env_var);
+    let accepted_effort_values = runtime_meta.and_then(|m| m.accepted_effort_values);
     let supports_acp_native = runtime_meta.is_some_and(|m| m.supports_acp_native_config);
     let required_fields: &[&str] = runtime_meta
         .map(|m| m.required_normalized_fields)
@@ -80,6 +81,7 @@ pub(crate) fn read_config_surface(
             &file_config.thinking_effort,
             &acp_effort,
             thinking_env_var,
+            accepted_effort_values,
             is_pre_spawn,
             session_cache,
             tiers,
@@ -487,22 +489,66 @@ fn build_thinking_field(
     file_effort: &Option<String>,
     acp_effort: &Option<String>,
     thinking_env_var: Option<&str>,
+    accepted_effort_values: Option<&'static [&'static str]>,
     is_pre_spawn: bool,
     session_cache: Option<&SessionConfigCache>,
     tiers: &InheritedConfigTiers,
 ) -> Option<NormalizedField> {
     // Tier ordering: record env > ACP > persona env > global env > definition env > config file.
-    let [rec_env, pers_env, glob_env, def_env] = thinking_env_var
-        .map(|k| {
-            env_candidates(
-                k,
-                &record.env_vars,
-                &tiers.persona_env,
-                &tiers.global_env,
-                &tiers.definition_env,
-            )
-        })
-        .unwrap_or([None, None, None, None]);
+    //
+    // When the runtime declares a static accepted-effort set (e.g. Goose), each of the
+    // record and persona tiers is resolved via `effort_tier_alias`, which applies
+    // within-tier legacy aliasing: if the native key is absent, BUZZ_AGENT_THINKING_EFFORT
+    // is used as a fallback when the value is in the harness's accepted set.
+    // Global env and definition env receive no legacy fallback (per plan).
+
+    // Resolve per-tier effort values.  For alias-aware runtimes we produce owned
+    // Option<String> to support within-tier legacy aliasing; for others we borrow
+    // directly from the maps.
+    //
+    // The four owned-value locals (`_rec_o` etc.) must outlive the `&str` borrows
+    // below; they are named with a leading underscore only to mark them as not
+    // used for anything other than keeping the allocation alive.
+    let _rec_o: Option<String>;
+    let _per_o: Option<String>;
+    let _glo_o: Option<String>;
+    let _def_o: Option<String>;
+
+    let rec_env: Option<&str>;
+    let pers_env: Option<&str>;
+    let glob_env: Option<&str>;
+    let def_env: Option<&str>;
+
+    if let Some((native, accepted)) = thinking_env_var.zip(accepted_effort_values) {
+        _rec_o = super::effort_tier_alias(&record.env_vars, native, accepted, false);
+        _per_o = super::effort_tier_alias(&tiers.persona_env, native, accepted, false);
+        _glo_o = super::effort_tier_alias(&tiers.global_env, native, accepted, true);
+        _def_o = super::effort_tier_alias(&tiers.definition_env, native, accepted, true);
+        rec_env = _rec_o.as_deref();
+        pers_env = _per_o.as_deref();
+        glob_env = _glo_o.as_deref();
+        def_env = _def_o.as_deref();
+    } else {
+        _rec_o = None;
+        _per_o = None;
+        _glo_o = None;
+        _def_o = None;
+        let [re, pe, ge, de] = thinking_env_var
+            .map(|k| {
+                env_candidates(
+                    k,
+                    &record.env_vars,
+                    &tiers.persona_env,
+                    &tiers.global_env,
+                    &tiers.definition_env,
+                )
+            })
+            .unwrap_or([None, None, None, None]);
+        rec_env = re;
+        pers_env = pe;
+        glob_env = ge;
+        def_env = de;
+    }
 
     // Effort same-value collapse (B heuristic): when ACP would be the winner
     // and its value exactly equals what inheritance already resolves to, fall

@@ -90,9 +90,8 @@ pub async fn discover_acp_providers(
 /// Write a user-defined harness definition to `<app-data>/custom_harnesses/<id>.json`.
 ///
 /// Validates the definition (id regex, builtin-id collision, non-empty command
-/// and label, env well-formedness) before touching the filesystem. Returns the
-/// merged catalog entry so the UI can update the provider list without triggering
-/// a full re-discover.
+/// and label, env well-formedness) before touching the filesystem. Returns the merged
+/// catalog entry so the UI can update the provider list without triggering a full re-discover.
 ///
 /// `original_id` handles the rename case: when the user edits an existing
 /// harness and changes its id, pass the old id here so the old file is removed
@@ -177,6 +176,7 @@ pub async fn save_custom_harness(
         model_env_var: None,
         provider_env_var: None,
         thinking_env_var: None,
+        accepted_effort_values: None,
         install_hint: definition.install_hint,
         install_instructions_url: definition.install_instructions_url,
         can_auto_install: false,

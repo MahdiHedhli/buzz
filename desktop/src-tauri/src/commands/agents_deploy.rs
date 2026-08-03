@@ -154,6 +154,16 @@ pub(super) fn build_deploy_payload(
 
 /// Pure serialization half of [`build_deploy_payload`]. Legacy top-level fields
 /// remain for display/bookkeeping; providers execute the resolved `launch` block.
+///
+/// `launch.env` is authoritative — it is built from the same
+/// `resolve_effective_agent_env_with_def` descriptor as local spawn, so the
+/// legacy-effort spawn bridge (which translates a pre-migration
+/// `BUZZ_AGENT_THINKING_EFFORT` record/persona value to the harness-native key
+/// such as `GOOSE_THINKING_EFFORT`) applies automatically.  The top-level
+/// `env_vars` field mirrors the raw merged user-env and is intentionally NOT
+/// bridged — it is legacy display/bookkeeping only.  If any supported provider
+/// is found to execute top-level `env_vars` instead of `launch.env`, that is a
+/// stop-and-report to the architect before scope is expanded.
 pub(super) fn deploy_payload_json(
     record: &ManagedAgentRecord,
     relay_url: String,
@@ -256,5 +266,54 @@ mod tests {
         assert_eq!(launch["policy_env"]["BUZZ_ACP_MAX_TURN_DURATION"], "23");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_AGENTS"], "4");
         assert_eq!(launch["owner_pubkey"], "owner-hex");
+    }
+
+    /// Delta-4 deploy parity: a Goose record with only a legacy effort key must
+    /// produce a `launch.env` with `GOOSE_THINKING_EFFORT` (not the legacy key).
+    /// The top-level `env_vars` field is intentionally unbridged — it retains
+    /// the raw legacy key for display/bookkeeping per the plan contract.
+    #[test]
+    fn launch_env_carries_native_goose_effort_for_legacy_only_record() {
+        use crate::managed_agents::{
+            config_bridge::LEGACY_THINKING_EFFORT_KEY, global_config::GlobalAgentConfig,
+            resolve_effective_harness_descriptor,
+        };
+
+        let mut record: ManagedAgentRecord = serde_json::from_value(serde_json::json!({
+            "pubkey": "abcd1234",
+            "name": "goose-agent",
+            "private_key_nsec": "nsec1fake",
+            "relay_url": "wss://relay.example",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "parallelism": 1,
+            "respond_to": RespondTo::OwnerOnly,
+            "respond_to_allowlist": [],
+            "runtime": "goose",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        // Pre-migration legacy key only — no native GOOSE_THINKING_EFFORT.
+        record
+            .env_vars
+            .insert(LEGACY_THINKING_EFFORT_KEY.to_string(), "high".to_string());
+
+        let descriptor =
+            resolve_effective_harness_descriptor(&record, &[], &GlobalAgentConfig::default())
+                .expect("descriptor must resolve for a valid Goose record");
+
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner");
+
+        // launch.env carries the native key (bridge applied).
+        assert_eq!(
+            launch["env"]["GOOSE_THINKING_EFFORT"], "high",
+            "launch.env must carry GOOSE_THINKING_EFFORT after bridge"
+        );
+        // The legacy key may also remain in launch.env (Goose ignores it); what
+        // matters is that the native key carries the effective value.
     }
 }

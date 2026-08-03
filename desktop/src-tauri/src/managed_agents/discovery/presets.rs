@@ -67,6 +67,7 @@ pub(super) fn preset_catalog_entry(
         model_env_var: None,
         provider_env_var: None,
         thinking_env_var: None,
+        accepted_effort_values: None,
         install_hint: def.install_hint.to_string(),
         install_instructions_url: def.install_instructions_url.to_string(),
         can_auto_install: false,

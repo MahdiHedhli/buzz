@@ -21,29 +21,20 @@
 //! * [`AgentReadiness`] / [`agent_readiness`] — evaluates the effective env
 //!   against the requirements for the resolved runtime and returns `Ready` or
 //!   `NotReady(Vec<Requirement>)`.
-//!
 //! ## Env-assembly precedence (mirrors `spawn_agent_child`)
+//! 1. Baked build defaults (`baked_build_env()`) — floor; layers above override.
+//! 2. Runtime metadata env vars — provider/model keys from `model_env_var`/`provider_env_var`.
+//! 3. Merged user env (`merged_user_env`) — persona env under record overrides; last-wins.
 //!
-//! 1. Baked build defaults (`baked_build_env()`) — injected first so the
-//!    layers above can override them.
-//! 2. Runtime metadata env vars (`runtime_metadata_env_vars`) — provider /
-//!    model env keys derived from the record's `model`/`provider` fields and
-//!    the runtime's `model_env_var`/`provider_env_var`.
-//! 3. Merged user env (`merged_user_env`) — live persona env under the
-//!    record's `env_vars` overrides, after reserved-key and malformed-key
-//!    filtering.  Last-wins on collision.
-//!
-//! The config-file tier (Goose `~/.config/goose/config.yaml`) is tracked
-//! separately because it is not part of the process env — the harness reads
-//! it at startup.  We do not evaluate it here; it is exposed for future
-//! UI display only.
+//! The config-file tier (`~/.config/goose/config.yaml`) is tracked separately
+//! because the harness reads it at startup; it is not part of the process env.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::managed_agents::{
     agent_env::baked_build_env,
-    config_bridge::read_goose_file_config,
+    config_bridge::{effort_tier_alias, read_goose_file_config, LEGACY_THINKING_EFFORT_KEY},
     discovery::{known_acp_runtime, KnownAcpRuntime},
     env_vars::merged_user_env,
     global_config::GlobalAgentConfig,
@@ -161,8 +152,7 @@ pub(crate) fn resolve_effective_harness_descriptor(
         }
     };
 
-    // Env: full layered resolution (same as resolve_effective_agent_env).
-    // Pass harness_def directly to avoid a second lookup.
+    // Env: full layered resolution (same as resolve_effective_agent_env, harness_def pre-fetched).
     let effective_env =
         resolve_effective_agent_env_with_def(record, personas, runtime_meta, global, harness_def);
 
@@ -211,9 +201,7 @@ pub(crate) fn resolve_effective_agent_env(
     resolve_effective_agent_env_with_def(record, personas, runtime, global, harness_def)
 }
 
-/// Inner implementation that accepts a pre-fetched `harness_def` to avoid a
-/// second registry lookup when the caller (e.g. `resolve_effective_harness_descriptor`)
-/// already has the definition in hand.
+/// Inner implementation that accepts a pre-fetched `harness_def` to avoid a second lookup.
 fn resolve_effective_agent_env_with_def(
     record: &ManagedAgentRecord,
     personas: &[AgentDefinition],
@@ -225,7 +213,6 @@ fn resolve_effective_agent_env_with_def(
 
     // Layer 1: baked build defaults (floor — internal builds only; OSS = empty).
     let mut env = baked_build_env();
-
     let (effective_model, effective_provider) =
         super::global_config::resolve_effective_model_provider(record, personas, global);
 
@@ -241,9 +228,7 @@ fn resolve_effective_agent_env_with_def(
         }
     }
 
-    // Layer 2b: definition env — the harness author's defaults (e.g. CURSOR_ACP=1).
-    // Applied as a floor below global so user env always wins on collision.
-    // Reserved keys are stripped by the shared `is_reserved_env_key` predicate.
+    // Layer 2b: definition env — harness author defaults; user env wins on collision.
     if let Some(ref def) = harness_def {
         for (key, value) in &def.env {
             if !super::env_vars::is_reserved_env_key(key) {
@@ -252,22 +237,30 @@ fn resolve_effective_agent_env_with_def(
         }
     }
 
-    // Layer 3a: global env vars — the lowest user-settable layer.
-    // Injected before persona/agent so per-agent values win on collision.
-    // `merged_user_env` with an empty "lower" map applies reserved/malformed-key
-    // filtering to the global map for free.
+    // Layer 3a: global env vars — lowest user-settable layer; per-agent wins on collision.
     let global_env = merged_user_env(&BTreeMap::new(), &global.env_vars);
     env.extend(global_env);
 
-    // Layer 3b: merged user env — live persona env under the record's own
-    // overrides (last-wins), after reserved/malformed-key filtering. Reading
-    // the persona live is what makes persona credential edits refresh on the
-    // next spawn instead of being frozen into the record.
-    let user_env = merged_user_env(
-        &super::env_vars::live_persona_env(personas, record.persona_id.as_deref()),
-        &record.env_vars,
-    );
+    // Layer 3b: merged user env — live persona env under record overrides.
+    let persona_env_raw = super::env_vars::live_persona_env(personas, record.persona_id.as_deref());
+    let user_env = merged_user_env(&persona_env_raw, &record.env_vars);
     env.extend(user_env);
+    // Bridge BUZZ_AGENT_THINKING_EFFORT to the harness native key (e.g. Goose).
+    // Per tier-first semantics: record legacy beats persona native. Global excluded.
+    if let Some((native, accepted)) = runtime
+        .and_then(|rt| rt.thinking_env_var.zip(rt.accepted_effort_values))
+        .filter(|(k, _)| *k != LEGACY_THINKING_EFFORT_KEY)
+    {
+        if !record.env_vars.contains_key(native) {
+            if let Some(v) = effort_tier_alias(&record.env_vars, native, accepted, false) {
+                env.insert(native.to_string(), v); // record legacy beats persona native
+            } else if !env.contains_key(native) {
+                if let Some(v) = effort_tier_alias(&persona_env_raw, native, accepted, false) {
+                    env.insert(native.to_string(), v);
+                }
+            }
+        }
+    }
 
     // Buzz shared compute is a native Buzz provider. Translate it to buzz-agent's
     // OpenAI-compatible transport only in the effective runtime environment.
@@ -1049,6 +1042,7 @@ mod tests {
             default_env: &[],
             supports_acp_native_config: false,
             thinking_env_var: None,
+            accepted_effort_values: None,
             max_tokens_env_var: None,
             context_limit_env_var: None,
             required_normalized_fields: &[],
@@ -1244,6 +1238,7 @@ mod tests {
             default_env: &[],
             supports_acp_native_config: false,
             thinking_env_var: None,
+            accepted_effort_values: None,
             max_tokens_env_var: None,
             context_limit_env_var: None,
             required_normalized_fields: &[],
@@ -1741,3 +1736,8 @@ mod tests {
 #[cfg(test)]
 #[path = "readiness_goose_file_config_tests.rs"]
 mod goose_file_config_tests;
+// Spawn-bridge tests (legacy BUZZ_AGENT_THINKING_EFFORT → native key) live in
+// a sibling file to keep this module within the desktop file-size ratchet.
+#[cfg(test)]
+#[path = "readiness_effort_bridge_tests.rs"]
+mod effort_bridge_tests;

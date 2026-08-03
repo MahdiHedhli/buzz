@@ -373,3 +373,136 @@ fn acp_effort_with_no_inherited_tier_stays_acp_config_option() {
     assert_eq!(effort.origin, ConfigOrigin::AcpConfigOption);
     assert!(effort.overridden_value.is_none());
 }
+
+// ── Phase 3 Delta-5: legacy-aliasing reader parity tests (Goose runtime) ─────
+//
+// Each test is paired with a spawn-bridge test in
+// `readiness_effort_bridge_tests.rs`.  Both must assert the same winning value
+// and origin so panel display and process env always agree.
+//
+// Fixtures: `test_runtime()` (Goose, GOOSE_THINKING_EFFORT, accepted set),
+// `test_record()` (empty env_vars).
+
+/// Delta-5 pair 1 (reader side): legacy-only record env → GOOSE_THINKING_EFFORT
+/// surfaces as BuzzExplicit.
+/// Spawn pair: `legacy_only_record_env_bridges_to_native_key`.
+#[test]
+fn goose_legacy_record_effort_surfaces_via_native_key_as_buzz_explicit() {
+    let mut record = test_record();
+    record.env_vars.insert(
+        crate::managed_agents::config_bridge::LEGACY_THINKING_EFFORT_KEY.to_string(),
+        "high".to_string(),
+    );
+    let runtime = test_runtime();
+
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+
+    let effort = surface
+        .normalized
+        .thinking_effort
+        .expect("legacy record effort must surface for Goose via alias");
+    assert_eq!(effort.value.as_deref(), Some("high"));
+    assert_eq!(effort.origin, ConfigOrigin::BuzzExplicit);
+}
+
+/// Delta-5 pair 2 (reader side): record has both native and legacy — native wins.
+/// Spawn pair: `native_and_legacy_in_record_native_wins_no_double_write`.
+#[test]
+fn goose_record_native_beats_legacy_in_reader() {
+    let mut record = test_record();
+    record
+        .env_vars
+        .insert("GOOSE_THINKING_EFFORT".to_string(), "medium".to_string());
+    record.env_vars.insert(
+        crate::managed_agents::config_bridge::LEGACY_THINKING_EFFORT_KEY.to_string(),
+        "high".to_string(),
+    );
+    let runtime = test_runtime();
+
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+
+    let effort = surface
+        .normalized
+        .thinking_effort
+        .expect("effort must surface from native key");
+    assert_eq!(
+        effort.value.as_deref(),
+        Some("medium"),
+        "native key must win over legacy when both present"
+    );
+    assert_eq!(effort.origin, ConfigOrigin::BuzzExplicit);
+}
+
+/// Delta-5 pair 3 (reader side): record legacy beats persona native (tier-first).
+/// Spawn pair: `record_legacy_beats_persona_native_in_spawn`.
+#[test]
+fn goose_record_legacy_beats_persona_native_in_reader() {
+    let mut record = test_record();
+    record.env_vars.insert(
+        crate::managed_agents::config_bridge::LEGACY_THINKING_EFFORT_KEY.to_string(),
+        "high".to_string(),
+    );
+    let runtime = test_runtime();
+    let tiers = persona_env_tiers("GOOSE_THINKING_EFFORT", "low");
+
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+
+    let effort = surface
+        .normalized
+        .thinking_effort
+        .expect("effort must surface");
+    // Tier-first: record legacy (high) beats persona native (low).
+    assert_eq!(effort.value.as_deref(), Some("high"));
+    assert_eq!(effort.origin, ConfigOrigin::BuzzExplicit);
+}
+
+/// Delta-5 pair 4 (reader side): invalid legacy value is skipped; persona tier wins.
+/// Spawn pair: `invalid_legacy_value_in_record_not_bridged`.
+#[test]
+fn goose_invalid_legacy_value_skipped_persona_tier_wins_in_reader() {
+    let mut record = test_record();
+    // "minimal" is not in Goose's accepted set.
+    record.env_vars.insert(
+        crate::managed_agents::config_bridge::LEGACY_THINKING_EFFORT_KEY.to_string(),
+        "minimal".to_string(),
+    );
+    let runtime = test_runtime();
+    let tiers = persona_env_tiers("GOOSE_THINKING_EFFORT", "low");
+
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+
+    let effort = surface
+        .normalized
+        .thinking_effort
+        .expect("persona-tier effort must surface after invalid legacy is skipped");
+    assert_eq!(
+        effort.value.as_deref(),
+        Some("low"),
+        "invalid legacy must be skipped; lower persona tier must win"
+    );
+    assert_eq!(effort.origin, ConfigOrigin::PersonaDefault);
+}
+
+/// Delta-5 pair 5 (reader side): global legacy is NOT surfaced as Goose effort.
+/// Spawn pair: `global_legacy_effort_is_not_bridged_to_native_key`.
+#[test]
+fn goose_global_legacy_effort_not_surfaced_in_reader() {
+    let record = test_record();
+    let runtime = test_runtime();
+    // Global env has the legacy key — must not be bridged to GOOSE_THINKING_EFFORT.
+    let tiers = global_env_tiers(
+        crate::managed_agents::config_bridge::LEGACY_THINKING_EFFORT_KEY,
+        "high",
+    );
+
+    // Use with_goose_path_root(None) to suppress file-config reading, isolating
+    // the global-legacy exclusion assertion.
+    let surface = with_goose_path_root(Some("/nonexistent/buzz-test-path"), || {
+        read_config_surface(&record, Some(runtime), None, &tiers)
+    });
+
+    assert!(
+        surface.normalized.thinking_effort.is_none(),
+        "global legacy effort must not surface as Goose effort"
+    );
+}

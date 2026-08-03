@@ -515,8 +515,8 @@ export type AcpRuntimeCatalogEntry = {
   modelEnvVar: string | null;
   /** Environment variable used to apply the selected LLM provider, when supported. */
   providerEnvVar: string | null;
-  /** Environment variable used to apply thinking effort, when supported. */
-  thinkingEnvVar: string | null;
+  thinkingEnvVar: string | null; // env var for thinking effort; null when not supported
+  acceptedEffortValues: string[] | null; // null → per-model catalog (buzz-agent); non-null → harness-static set
   installHint: string;
   installInstructionsUrl: string;
   canAutoInstall: boolean;

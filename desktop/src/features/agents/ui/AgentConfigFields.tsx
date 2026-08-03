@@ -66,12 +66,8 @@ export const EMPTY_GLOBAL_CONFIG: GlobalAgentConfig = {
   preferred_runtime: null,
 };
 
-/** Baked env keys that route to structured controls, not the generic env editor. */
-const BAKED_STRUCTURED_KEYS = new Set([
-  "BUZZ_AGENT_PROVIDER",
-  "BUZZ_AGENT_MODEL",
-  BUZZ_AGENT_THINKING_EFFORT,
-]);
+/** Baked env keys that always route to structured controls, not the generic env editor. */
+const BAKED_STATIC_KEYS = new Set(["BUZZ_AGENT_PROVIDER", "BUZZ_AGENT_MODEL"]);
 
 const PROGRESSIVE_FIELDS_TRANSITION = {
   duration: 0.22,
@@ -295,15 +291,19 @@ export function AgentConfigFields({
     modelIsOptional ||
     (config.model?.trim().length ?? 0) > 0 ||
     fallbackModel !== null;
-  const bakedEffort = React.useMemo(
-    () =>
-      bakedEnv.find((e) => e.key === BUZZ_AGENT_THINKING_EFFORT)?.value ?? null,
-    [bakedEnv],
-  );
-  const bakedGenericRows = React.useMemo<readonly InheritedEnvRow[]>(
-    () => bakedEnv.filter((e) => !BAKED_STRUCTURED_KEYS.has(e.key)),
-    [bakedEnv],
-  );
+  const bakedEffort = React.useMemo(() => {
+    const nk = selectedRuntime?.thinkingEnvVar;
+    return (
+      (nk ? bakedEnv.find((e) => e.key === nk)?.value : null) ??
+      bakedEnv.find((e) => e.key === BUZZ_AGENT_THINKING_EFFORT)?.value ??
+      null
+    );
+  }, [bakedEnv, selectedRuntime]);
+  const bakedGenericRows = React.useMemo<readonly InheritedEnvRow[]>(() => {
+    const nk = selectedRuntime?.thinkingEnvVar;
+    const hidden = nk ? new Set([...BAKED_STATIC_KEYS, nk]) : BAKED_STATIC_KEYS;
+    return bakedEnv.filter((e) => !hidden.has(e.key));
+  }, [bakedEnv, selectedRuntime]);
 
   const providerValue = providerFieldVisible ? (config.provider ?? "") : "";
   const providerForDiscovery =
@@ -381,12 +381,9 @@ export function AgentConfigFields({
     showCustomModelOption,
   });
 
-  // Mount-time healing policy: onboarding page 4 edits the root config during
-  // first-run (no higher layers to inherit from), so acting on open is safe
-  // and intentional there — it heals stale state and picks a valid model.
-  // Evergreen surfaces (Settings, dialogs) edit saved data that may pair with
-  // higher layers (see PR #2148 review thread), so they only act after the
-  // user explicitly edits the provider in this session.
+  // Mount-time healing policy: onboarding page 4 edits root config during first-run
+  // (no higher layers to inherit from), so healing on open is safe and intentional.
+  // Evergreen surfaces only heal after explicit provider edits (see PR #2148).
   const healOnMount =
     fieldModel.dependentValuePolicy.onCatalogMismatch === "onboardingCleanup";
   const userEditedProviderRef = React.useRef(false);
@@ -506,10 +503,10 @@ export function AgentConfigFields({
     onCustomModelEditingChange,
     effortPersistenceKey,
   ]);
-  const { validValues: effortValidForAutoClear } = getProviderEffortConfig(
-    config.provider ?? "",
-    config.model ?? "",
-  );
+  const { validValues: effortValidForAutoClear } =
+    selectedRuntime?.acceptedEffortValues != null
+      ? { validValues: selectedRuntime.acceptedEffortValues }
+      : getProviderEffortConfig(config.provider ?? "", config.model ?? "");
   useEffortAutoClear({
     currentEffort: currentEffortForAutoClear,
     effortValid: effortValidForAutoClear,
@@ -632,7 +629,12 @@ export function AgentConfigFields({
     ? (config.provider ?? "")
     : implicitEffortProvider;
   const { validValues: effortValid, defaultValue: effortDefault } =
-    getProviderEffortConfig(effortProvider, config.model ?? "");
+    selectedRuntime?.acceptedEffortValues != null
+      ? {
+          validValues: selectedRuntime.acceptedEffortValues,
+          defaultValue: null,
+        }
+      : getProviderEffortConfig(effortProvider, config.model ?? "");
   const currentEffort = effortPersistenceKey
     ? (config.env_vars[effortPersistenceKey] ?? "")
     : "";
@@ -914,7 +916,9 @@ export function AgentConfigFields({
                     requiredKeys={advancedRequiredEnvKeys}
                     value={Object.fromEntries(
                       Object.entries(config.env_vars).filter(
-                        ([k]) => k !== BUZZ_AGENT_THINKING_EFFORT,
+                        ([k]) =>
+                          k !==
+                          (effortPersistenceKey ?? BUZZ_AGENT_THINKING_EFFORT),
                       ),
                     )}
                   />
@@ -933,7 +937,8 @@ export function AgentConfigFields({
               requiredKeys={advancedRequiredEnvKeys}
               value={Object.fromEntries(
                 Object.entries(config.env_vars).filter(
-                  ([k]) => k !== BUZZ_AGENT_THINKING_EFFORT,
+                  ([k]) =>
+                    k !== (effortPersistenceKey ?? BUZZ_AGENT_THINKING_EFFORT),
                 ),
               )}
             />

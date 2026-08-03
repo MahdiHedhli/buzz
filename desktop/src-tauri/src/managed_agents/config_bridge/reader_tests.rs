@@ -54,6 +54,7 @@ fn test_runtime() -> &'static KnownAcpRuntime {
         config_file_format: Some("yaml"),
         supports_acp_native_config: true,
         thinking_env_var: Some("GOOSE_THINKING_EFFORT"),
+        accepted_effort_values: Some(&["none", "low", "medium", "high", "xhigh", "max"]),
         max_tokens_env_var: Some("GOOSE_MAX_TOKENS"),
         context_limit_env_var: Some("GOOSE_CONTEXT_LIMIT"),
         required_normalized_fields: &["model", "provider"],
@@ -642,6 +643,7 @@ fn buzz_agent_runtime() -> &'static KnownAcpRuntime {
         config_file_format: None,
         supports_acp_native_config: false,
         thinking_env_var: Some("BUZZ_AGENT_THINKING_EFFORT"),
+        accepted_effort_values: None, // buzz-agent uses per-model catalog
         max_tokens_env_var: Some("BUZZ_AGENT_MAX_OUTPUT_TOKENS"),
         context_limit_env_var: Some("BUZZ_AGENT_MAX_CONTEXT_TOKENS"),
         required_normalized_fields: &["model", "provider"],
