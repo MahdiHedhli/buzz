@@ -8,10 +8,10 @@ use rusqlite::Connection;
 use super::{
     advance_disposition, apply_journal_schema_pub, atomic_write_with_fsync,
     canonical_dev_anchor_pub, cas_generation, decode_agent_store, decode_team_store,
-    insert_inbox_event, insert_operation, insert_outbox_event, mutate_store, open_journal,
-    pin_compensation, read_generation, read_inbox_events, read_nonterminal_operations,
-    read_operation, read_outbox_events, set_nonterminal_follow_up, tombstone_key, CasOutcome,
-    Disposition, Generation, InsertEventOutcome, JournalLockGuard, StoreState, TransitionOutcome,
+    insert_inbox_event, insert_operation, insert_outbox_event, open_journal, pin_compensation,
+    read_generation, read_inbox_events, read_nonterminal_operations, read_operation,
+    read_outbox_events, set_nonterminal_follow_up, tombstone_key, CasOutcome, Disposition,
+    Generation, InsertEventOutcome, JournalLockGuard, TransitionOutcome,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -548,8 +548,6 @@ fn test_two_dev_worktree_paths_resolve_to_same_canonical_anchor() {
 
 #[test]
 fn test_mutate_store_malformed_agents_json_is_fail_closed() {
-    use crate::managed_agents::ManagedAgentRecord;
-    use crate::managed_agents::TeamRecord;
     // Build a tmp anchor dir with a malformed managed-agents.json.
     let dir = tmp_dir();
     let anchor = dir.path().to_path_buf();

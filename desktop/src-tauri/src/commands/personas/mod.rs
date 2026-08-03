@@ -156,12 +156,11 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
                     .managed_agent_processes
                     .lock()
                     .map_err(|error| error.to_string())?;
-                let result = sync_managed_agent_processes(
+                sync_managed_agent_processes(
                     &mut agents,
                     &mut runtimes,
                     &current_instance_id(&app),
-                );
-                result
+                )
                 // runtimes drops here (process lock released before Phase 2).
             };
             let store_guard = if sync_exited.0 { save_managed_agents(&app, store_guard, &agents)? } else { store_guard };
