@@ -75,14 +75,60 @@ test("Goose exposes provider, model, and its real effort application key", () =>
     field(model, "effort").optionSource,
     "legacyProviderModelCatalog",
   );
+  // Phase 2: currentPersistence key is now the native key (not the legacy key).
   assert.deepEqual(field(model, "effort").currentPersistence, {
     kind: "envVar",
-    key: "BUZZ_AGENT_THINKING_EFFORT",
+    key: "GOOSE_THINKING_EFFORT",
   });
   assert.deepEqual(field(model, "effort").targetApplication, {
     kind: "envVar",
     key: "GOOSE_THINKING_EFFORT",
   });
+});
+
+test("Goose effort reads legacy BUZZ_AGENT_THINKING_EFFORT as fallback when native key absent", () => {
+  // Pre-migration save: effort stored under legacy key only.
+  const legacyConfig = {
+    env_vars: { BUZZ_AGENT_THINKING_EFFORT: "medium" },
+    model: "test-model",
+    preferred_runtime: null,
+    provider: "anthropic",
+  };
+  const model = deriveAgentConfigFieldModel({
+    config: legacyConfig,
+    runtime: runtime("goose", {
+      modelEnvVar: "GOOSE_MODEL",
+      providerEnvVar: "GOOSE_PROVIDER",
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+    }),
+    scope: "global",
+  });
+  // Legacy value is surfaced via read-old fallback.
+  assert.equal(field(model, "effort").value, "medium");
+});
+
+test("Goose effort prefers native key over legacy key when both present", () => {
+  // Post-migration save: native key written; legacy key still present from old save.
+  const bothConfig = {
+    env_vars: {
+      GOOSE_THINKING_EFFORT: "high",
+      BUZZ_AGENT_THINKING_EFFORT: "low",
+    },
+    model: "test-model",
+    preferred_runtime: null,
+    provider: "anthropic",
+  };
+  const model = deriveAgentConfigFieldModel({
+    config: bothConfig,
+    runtime: runtime("goose", {
+      modelEnvVar: "GOOSE_MODEL",
+      providerEnvVar: "GOOSE_PROVIDER",
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+    }),
+    scope: "global",
+  });
+  // Native key wins over legacy key.
+  assert.equal(field(model, "effort").value, "high");
 });
 
 test("Claude models effort as a deferred native ACP option", () => {

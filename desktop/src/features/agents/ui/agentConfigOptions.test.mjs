@@ -190,6 +190,30 @@ test("resetConfigForHarnessChange does not carry relay mesh to Goose", () => {
   assert.equal(resetConfigForHarnessChange(config, "goose").provider, null);
 });
 
+test("resetConfigForHarnessChange deletes prev native thinking key when it differs from legacy", () => {
+  const config = {
+    env_vars: {
+      GOOSE_THINKING_EFFORT: "high",
+      BUZZ_AGENT_THINKING_EFFORT: "medium",
+      KEEP_ME: "yes",
+    },
+    model: "goose-model",
+    preferred_runtime: "goose",
+    provider: "anthropic",
+  };
+
+  // Simulate switching away from Goose (prevNativeThinkingEnvKey = "GOOSE_THINKING_EFFORT").
+  assert.deepEqual(
+    resetConfigForHarnessChange(config, "buzz-agent", "GOOSE_THINKING_EFFORT"),
+    {
+      env_vars: { KEEP_ME: "yes" },
+      model: null,
+      preferred_runtime: "buzz-agent",
+      provider: "anthropic",
+    },
+  );
+});
+
 // ── getPersonaModelOptions — codex/claude do not use global provider ──────────
 //
 // The discovery call in AgentDefinitionDialog passes

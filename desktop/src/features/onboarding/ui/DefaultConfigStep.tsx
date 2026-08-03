@@ -177,7 +177,11 @@ function AgentDefaultsSection({
 
   const handleHarnessChange = React.useCallback(
     (runtimeId: string) => {
-      const next = resetConfigForHarnessChange(config, runtimeId);
+      const next = resetConfigForHarnessChange(
+        config,
+        runtimeId,
+        selectedRuntime?.thinkingEnvVar,
+      );
       setIsCustomModelEditing(false);
       setIsCustomProvider(false);
       updateDraft(next, {
@@ -185,7 +189,7 @@ function AgentDefaultsSection({
         isCustomProvider: false,
       });
     },
-    [config, updateDraft],
+    [config, selectedRuntime, updateDraft],
   );
 
   React.useEffect(() => {

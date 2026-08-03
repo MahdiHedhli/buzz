@@ -32,11 +32,13 @@ with a TypeScript lookup table or an id comparison in a component.
    (`hasRenderableAgentConfigField`, `getRenderableEffortField`).
 2. **Effort reads/writes go through the descriptor.** Use the effort
    descriptor's `currentPersistence` key — never a raw
-   `BUZZ_AGENT_THINKING_EFFORT` literal in UI code. `currentPersistence` is
-   where the value lives *today*; `targetApplication` is how the harness
-   *should* receive it. They intentionally differ until PR 2.7 migrates
-   Goose/Claude — do not "fix" one to match the other without doing the
-   migration work.
+   `BUZZ_AGENT_THINKING_EFFORT` literal in UI code. `currentPersistence.key`
+   is the harness-native env key (e.g. `GOOSE_THINKING_EFFORT` for Goose,
+   `BUZZ_AGENT_THINKING_EFFORT` for buzz-agent) and is where the value lives.
+   `targetApplication` carries the same native key. Pre-migration saves
+   written under the legacy `BUZZ_AGENT_THINKING_EFFORT` key are honoured via
+   a read-old fallback in `deriveAgentConfigFieldModel`; on re-save the value
+   is written to the native key only.
 3. **Field absence has a named reason, not a boolean.** Codex effort is
    `ownedByModelId`; Claude effort is `deferredUntilNativeOptionsAvailable`.
    New absences get new named reasons in `AgentConfigOmission` /

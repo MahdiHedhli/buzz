@@ -208,9 +208,21 @@ export function runtimeSupportsLlmProviderSelection(runtimeId: string) {
 export function resetConfigForHarnessChange(
   config: GlobalAgentConfig,
   runtimeId: string,
+  /** The previous runtime's native thinking-effort env key, if any. When
+   * provided the key is deleted alongside the legacy `BUZZ_AGENT_THINKING_EFFORT`
+   * so that pre-migration saves under the native key are also cleared. */
+  prevNativeThinkingEnvKey?: string | null,
 ): GlobalAgentConfig {
   const nextEnvVars = { ...config.env_vars };
+  // Always clear the legacy key (written by pre-migration saves).
   delete nextEnvVars[BUZZ_AGENT_THINKING_EFFORT];
+  // Clear the previous runtime's native key when it differs from the legacy key.
+  if (
+    prevNativeThinkingEnvKey &&
+    prevNativeThinkingEnvKey !== BUZZ_AGENT_THINKING_EFFORT
+  ) {
+    delete nextEnvVars[prevNativeThinkingEnvKey];
+  }
 
   return {
     ...config,

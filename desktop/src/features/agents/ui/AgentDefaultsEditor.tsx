@@ -185,7 +185,13 @@ export function AgentDefaultsEditor({
   }
 
   function handleHarnessChange(runtimeId: string) {
-    handleConfigChange(resetConfigForHarnessChange(config, runtimeId));
+    handleConfigChange(
+      resetConfigForHarnessChange(
+        config,
+        runtimeId,
+        selectedRuntime?.thinkingEnvVar,
+      ),
+    );
     setConfigIsValid(false);
     setIsCustomModelEditing(false);
     setIsCustomProvider(false);

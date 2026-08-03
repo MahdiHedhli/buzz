@@ -136,11 +136,18 @@ export function deriveAgentConfigFieldModel({
           : "legacyProviderModelCatalog",
       currentPersistence: {
         kind: "envVar",
-        key: BUZZ_AGENT_THINKING_EFFORT,
+        // Native key: write under the key the harness actually reads.
+        // read-old: fall back to the legacy BUZZ_AGENT_THINKING_EFFORT value
+        // so pre-migration saves are honoured until the user re-saves.
+        key: runtime.thinkingEnvVar,
       },
       targetApplication: { kind: "envVar", key: runtime.thinkingEnvVar },
       render: "control",
-      value: valueFromEnv(config, BUZZ_AGENT_THINKING_EFFORT),
+      value:
+        valueFromEnv(config, runtime.thinkingEnvVar) ??
+        (runtime.thinkingEnvVar !== BUZZ_AGENT_THINKING_EFFORT
+          ? valueFromEnv(config, BUZZ_AGENT_THINKING_EFFORT)
+          : null),
     });
   } else if (runtime?.id === "claude") {
     fields.push({

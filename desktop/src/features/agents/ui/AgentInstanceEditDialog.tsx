@@ -34,6 +34,8 @@ import {
   getDefaultLlmModelLabel,
   getDefaultPersonaRuntime,
   getPersonaProviderOptions,
+  getProviderApiKeyEnvVar,
+  getProviderApiKeyLabel,
   isMissingRequiredDropdownField,
   NO_RUNTIME_DROPDOWN_VALUE,
   PERSONA_FIELD_CONTROL_CLASS,
@@ -77,10 +79,6 @@ import {
   getBakedModelInheritLabel,
   getBakedProviderInheritLabel,
 } from "./bakedEnvHelpers";
-import {
-  getProviderApiKeyEnvVar,
-  getProviderApiKeyLabel,
-} from "./agentConfigOptions";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentAiDefaultsNotice } from "./AgentAiDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
@@ -367,6 +365,7 @@ export function AgentInstanceEditDialog({
     ],
   );
 
+  const nativeThinkingKey = selectedRuntime?.thinkingEnvVar;
   const {
     globalConfig,
     inheritedDefaults: {
@@ -374,7 +373,7 @@ export function AgentInstanceEditDialog({
       model: inheritedModelDefault,
     },
     inheritedEnvVars: inheritedEnvVarsForAdvanced,
-  } = useAgentDialogDefaults({ inheritedEnvVars, open });
+  } = useAgentDialogDefaults({ inheritedEnvVars, open, nativeThinkingKey });
 
   // Runtime/provider-required credential state, derived from the PROSPECTIVE
   // post-submit runtime — see the hook for the inherit-transition rationale.
