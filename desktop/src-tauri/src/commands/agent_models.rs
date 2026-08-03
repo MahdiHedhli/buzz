@@ -18,14 +18,13 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         build_managed_agent_summary, current_instance_id, discovery_env_with_baked_floor,
-        find_managed_agent_mut, known_acp_runtime, load_global_agent_config, load_managed_agents,
-        load_personas, managed_agent_avatar_url, missing_command_message, normalize_agent_args,
-        resolve_command, save_managed_agents, sync_managed_agent_processes, try_regenerate_nest,
-        AgentModelInfo, AgentModelsResponse, UpdateManagedAgentRequest, UpdateManagedAgentResponse,
-        DEFAULT_ACP_COMMAND,
+        known_acp_runtime, load_global_agent_config, load_managed_agents, load_personas,
+        managed_agent_avatar_url, missing_command_message, mutate_managed_agent,
+        normalize_agent_args, resolve_command, save_managed_agents, sync_managed_agent_processes,
+        try_regenerate_nest, AgentModelInfo, AgentModelsResponse, UpdateManagedAgentRequest,
+        UpdateManagedAgentResponse, DEFAULT_ACP_COMMAND,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
-    util::now_iso,
 };
 
 /// Query available models from an agent via `buzz-acp models --json`.
@@ -39,7 +38,7 @@ pub async fn get_agent_models(
     state: State<'_, AppState>,
 ) -> Result<AgentModelsResponse, String> {
     let (resolved_acp, agent_command, discovery) = {
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
@@ -51,7 +50,7 @@ pub async fn get_agent_models(
         let (sync_changed, exited_pubkeys) =
             sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
         if sync_changed {
-            save_managed_agents(&app, &records)?;
+            let _store_guard = save_managed_agents(&app, store_guard, &records)?;
         }
         for pubkey in &exited_pubkeys {
             state.clear_agent_session_caches(pubkey);
@@ -814,155 +813,261 @@ pub async fn update_managed_agent(
     state: State<'_, AppState>,
 ) -> Result<UpdateManagedAgentResponse, String> {
     // Phase 1: local save (synchronous, under lock)
-    let (summary, sync_params, rollback) = {
-        let _store_guard = state
+    //
+    // Validation that must run before the mutation closure (needs borrow on
+    // respond_to_allowlist before input is moved):
+    let prospective_allowlist_opt = match input.respond_to_allowlist.as_ref() {
+        Some(list) => Some(crate::managed_agents::validate_respond_to_allowlist(list)?),
+        None => None,
+    };
+    let prospective_mode_opt = input.respond_to;
+    // Validate the combined mode + allowlist before entering the closure.
+    // (Full merge happens inside the closure against the live record; here we
+    // only catch the statically-checkable Allowlist + empty-list case.)
+    if prospective_mode_opt == Some(crate::managed_agents::RespondTo::Allowlist) {
+        if let Some(ref list) = prospective_allowlist_opt {
+            if list.is_empty() {
+                return Err(
+                    "respond-to mode 'allowlist' requires at least one pubkey in the allowlist"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let (summary, sync_params, rollback, _op_id) = {
+        // Phase 1a: sync-only save to flush exited agents (no journal entry).
+        // Done under a brief lock that is released before the journalled mutation.
+        {
+            let sync_guard = state
+                .managed_agents_store_lock
+                .lock()
+                .map_err(|e| e.to_string())?;
+            let mut runtimes_tmp = state
+                .managed_agent_processes
+                .lock()
+                .map_err(|e| e.to_string())?;
+            let mut records = load_managed_agents(&app)?;
+            let (sync_changed, exited_pubkeys) = sync_managed_agent_processes(
+                &mut records,
+                &mut runtimes_tmp,
+                &current_instance_id(&app),
+            );
+            // Guard consumed by save_managed_agents; if unchanged, drop it.
+            if sync_changed {
+                let _sync_guard = save_managed_agents(&app, sync_guard, &records)?;
+            }
+            for pk in &exited_pubkeys {
+                state.clear_agent_session_caches(pk);
+            }
+        }
+
+        // Phase 1b: journalled mutation under a fresh lock.
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
-        let mut records = load_managed_agents(&app)?;
-        let mut runtimes = state
+        let runtimes = state
             .managed_agent_processes
             .lock()
             .map_err(|e| e.to_string())?;
-        let (_, exited_pubkeys) =
-            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
-        for pubkey in &exited_pubkeys {
-            state.clear_agent_session_caches(pubkey);
-        }
 
-        let record = find_managed_agent_mut(&mut records, &input.pubkey)?;
-        let previous_record = record.clone();
+        // Capture all update fields for the closure.
+        let update_name = input.name;
+        let update_model = input.model;
+        let update_provider = input.provider;
+        let update_system_prompt = input.system_prompt;
+        let update_parallelism = input.parallelism;
+        let update_relay_url = input.relay_url;
+        let update_acp_command = input.acp_command;
+        let update_agent_command = input.agent_command;
+        let update_harness_override = input.harness_override;
+        let update_agent_args = input.agent_args;
+        let update_env_vars = input.env_vars;
+        let prospective_allowlist = prospective_allowlist_opt;
+        let prospective_mode = prospective_mode_opt;
+        let pubkey_str = input.pubkey.clone();
+        let op_id = crate::managed_agents::store_journal::new_operation_id();
+        let op_id_for_closure = op_id.clone();
 
-        let mut name_changed = false;
-        if let Some(name_update) = input.name {
-            let trimmed = name_update.trim().to_string();
-            if !trimmed.is_empty() && trimmed != record.name {
-                record.name = trimmed;
-                name_changed = true;
+        // Load personas before the closure (capture by move).
+        let personas_for_closure = load_personas(&app).unwrap_or_default();
+
+        let (record_out, (name_changed, previous_record), _guard) =
+            mutate_managed_agent(&app, store_guard, &input.pubkey, move |record, journal| {
+                let previous_record = record.clone();
+                let mut name_changed = false;
+
+                if let Some(name_update) = update_name {
+                    let trimmed = name_update.trim().to_string();
+                    if !trimmed.is_empty() && trimmed != record.name {
+                        record.name = trimmed;
+                        name_changed = true;
+                    }
+                }
+                apply_model_provider_prompt_update(
+                    record,
+                    update_model,
+                    update_provider,
+                    update_system_prompt,
+                );
+                if let Some(parallelism) = update_parallelism {
+                    record.parallelism = parallelism;
+                }
+                // turn_timeout_seconds is intentionally not applied here —
+                // BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored by the harness.
+                // Use idle_timeout_seconds or max_turn_duration_seconds instead.
+                // Store the relay override exactly as supplied (trimmed). An explicit
+                // value pins the agent; empty falls back to the workspace relay at
+                // read-time. A name-only edit (relay_url == None) leaves the pin intact.
+                if let Some(relay_url) = update_relay_url {
+                    record.relay_url = relay_url.trim().to_string();
+                }
+                if let Some(acp_command) = update_acp_command {
+                    record.acp_command = acp_command;
+                }
+                // Harness edit: the persona's runtime is authoritative, so an explicit
+                // `agent_command_override` is persisted ONLY when the user picks a
+                // command that diverges from the persona, and the empty/whitespace
+                // "Inherit from persona" sentinel clears both the pin and the
+                // materialized record runtime. A name-only edit
+                // (`agent_command == None`) leaves the pin intact. `harness_override`
+                // threads the user's explicit intent — see `apply_agent_command_update`
+                // and `update_time_agent_command_override` for the full resolution
+                // rules.
+                if let Some(agent_command) = update_agent_command {
+                    let personas = &personas_for_closure;
+                    crate::managed_agents::apply_agent_command_update(
+                        record,
+                        personas,
+                        &agent_command,
+                        update_harness_override,
+                    );
+                }
+                if let Some(agent_args) = update_agent_args {
+                    record.agent_args = agent_args;
+                }
+                // mcp_command is intentionally not applied here — the effective MCP
+                // command is always catalog-derived (known_acp_runtime at spawn time)
+                // and the per-record field is never read by the runtime.
+                if let Some(env_vars) = update_env_vars {
+                    crate::managed_agents::validate_user_env_keys(&env_vars)?;
+                    record.env_vars = env_vars;
+                }
+
+                // Native provider/model fields are authoritative. Keep the typed marker
+                // derived for new records while retaining legacy typed records for
+                // non-native providers.
+                if record.provider.as_deref() == Some(crate::managed_agents::RELAY_MESH_PROVIDER_ID)
+                {
+                    let model_ref = record
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or(crate::managed_agents::RELAY_MESH_AUTO_MODEL_ID)
+                        .to_string();
+                    record.model = Some(model_ref.clone());
+                    record.relay_mesh = Some(crate::managed_agents::RelayMeshConfig { model_ref });
+                }
+
+                // Inbound author gate: merge patch onto current values, then
+                // validate the merged state.
+                let merged_mode = prospective_mode.unwrap_or(record.respond_to);
+                let merged_allowlist = prospective_allowlist
+                    .clone()
+                    .unwrap_or_else(|| record.respond_to_allowlist.clone());
+                if merged_mode == crate::managed_agents::RespondTo::Allowlist
+                    && merged_allowlist.is_empty()
+                {
+                    return Err(
+                        "respond-to mode 'allowlist' requires at least one pubkey in the allowlist"
+                            .to_string(),
+                    );
+                }
+                record.respond_to = merged_mode;
+                if prospective_allowlist.is_some() {
+                    record.respond_to_allowlist = merged_allowlist;
+                }
+
+                record.updated_at = crate::util::now_iso();
+
+                // Journal: operation record + CAS before the file write.
+                let (current_gen, is_tombstone) =
+                    crate::managed_agents::store_journal::read_generation(journal, &pubkey_str)?;
+                if is_tombstone {
+                    return Err(format!(
+                        "agent {pubkey_str} has been tombstoned; update rejected"
+                    ));
+                }
+                crate::managed_agents::store_journal::insert_operation(
+                    journal,
+                    &op_id_for_closure,
+                    "update",
+                    &pubkey_str,
+                    current_gen,
+                )?;
+                match crate::managed_agents::store_journal::cas_generation(
+                    journal,
+                    &pubkey_str,
+                    current_gen,
+                )? {
+                    crate::managed_agents::store_journal::CasOutcome::Committed { .. } => {}
+                    crate::managed_agents::store_journal::CasOutcome::Conflict { current } => {
+                        return Err(format!(
+                            "agent {pubkey_str} generation conflict (expected {}, got {}); retry",
+                            current_gen.0, current.0
+                        ));
+                    }
+                    crate::managed_agents::store_journal::CasOutcome::Tombstoned { .. } => {
+                        return Err(format!(
+                            "agent {pubkey_str} was concurrently tombstoned; update rejected"
+                        ));
+                    }
+                }
+
+                Ok((name_changed, previous_record))
+            })?;
+
+        // Advance operation to committed after the file write.
+        {
+            let anchor = crate::managed_agents::store_journal::store_anchor_dir(&app)?;
+            if let Ok(journal) = crate::managed_agents::store_journal::open_journal(&anchor) {
+                let _ = crate::managed_agents::store_journal::advance_disposition(
+                    &journal,
+                    &op_id,
+                    &crate::managed_agents::store_journal::Disposition::Pending,
+                    &crate::managed_agents::store_journal::Disposition::Committed,
+                );
             }
         }
-        apply_model_provider_prompt_update(
-            record,
-            input.model,
-            input.provider,
-            input.system_prompt,
-        );
-        if let Some(parallelism) = input.parallelism {
-            record.parallelism = parallelism;
-        }
-        // turn_timeout_seconds is intentionally not applied here —
-        // BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored by the harness.
-        // Use idle_timeout_seconds or max_turn_duration_seconds instead.
-        // Store the relay override exactly as supplied (trimmed). An explicit
-        // value pins the agent; empty falls back to the workspace relay at
-        // read-time. A name-only edit (relay_url == None) leaves the pin intact.
-        if let Some(relay_url) = input.relay_url {
-            record.relay_url = relay_url.trim().to_string();
-        }
-        if let Some(acp_command) = input.acp_command {
-            record.acp_command = acp_command;
-        }
-        // Harness edit: the persona's runtime is authoritative, so an explicit
-        // `agent_command_override` is persisted ONLY when the user picks a
-        // command that diverges from the persona, and the empty/whitespace
-        // "Inherit from persona" sentinel clears both the pin and the
-        // materialized record runtime. A name-only edit
-        // (`agent_command == None`) leaves the pin intact. `harness_override`
-        // threads the user's explicit intent — see `apply_agent_command_update`
-        // and `update_time_agent_command_override` for the full resolution
-        // rules.
-        if let Some(agent_command) = input.agent_command {
-            let personas = load_personas(&app).unwrap_or_default();
-            crate::managed_agents::apply_agent_command_update(
-                record,
-                &personas,
-                &agent_command,
-                input.harness_override,
-            );
-        }
-        if let Some(agent_args) = input.agent_args {
-            record.agent_args = agent_args;
-        }
-        // mcp_command is intentionally not applied here — the effective MCP
-        // command is always catalog-derived (known_acp_runtime at spawn time)
-        // and the per-record field is never read by the runtime.
-        if let Some(env_vars) = input.env_vars {
-            crate::managed_agents::validate_user_env_keys(&env_vars)?;
-            record.env_vars = env_vars;
-        }
 
-        // Native provider/model fields are authoritative. Keep the typed marker
-        // derived for new records while retaining legacy typed records for
-        // non-native providers.
-        if record.provider.as_deref() == Some(crate::managed_agents::RELAY_MESH_PROVIDER_ID) {
-            let model_ref = record
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(crate::managed_agents::RELAY_MESH_AUTO_MODEL_ID)
-                .to_string();
-            record.model = Some(model_ref.clone());
-            record.relay_mesh = Some(crate::managed_agents::RelayMeshConfig { model_ref });
-        }
-
-        // Inbound author gate: merge patch onto current values, then validate
-        // the merged state. This lets a single update switch to Allowlist AND
-        // supply pubkeys atomically.
-        let prospective_mode = input.respond_to.unwrap_or(record.respond_to);
-        let prospective_allowlist = match input.respond_to_allowlist.as_ref() {
-            Some(list) => crate::managed_agents::validate_respond_to_allowlist(list)?,
-            None => record.respond_to_allowlist.clone(),
-        };
-        if prospective_mode == crate::managed_agents::RespondTo::Allowlist
-            && prospective_allowlist.is_empty()
-        {
-            return Err(
-                "respond-to mode 'allowlist' requires at least one pubkey in the allowlist"
-                    .to_string(),
-            );
-        }
-        record.respond_to = prospective_mode;
-        // Preserve the persisted allowlist across mode toggles — only replace
-        // when the caller explicitly supplied a new list.
-        if input.respond_to_allowlist.is_some() {
-            record.respond_to_allowlist = prospective_allowlist;
-        }
-
-        record.updated_at = now_iso();
-
-        save_managed_agents(&app, &records)?;
-
-        let record = records
-            .iter()
-            .find(|r| r.pubkey == input.pubkey)
-            .ok_or_else(|| format!("agent {} not found", input.pubkey))?;
-
-        // Publish the edit to the relay. After-save, inside the lock, before
+        // Publish the edit to the relay.
         // any .await. The retention upsert hashes the opt-IN projection, so an
         // update that touched only runtime/local fields is a no-op publish.
-        super::agents::retain_managed_agent_pending(&app, &state, record);
+        super::agents::retain_managed_agent_pending(&app, &state, &record_out, None);
 
         let sync_params = if name_changed {
-            let agent_keys = Keys::parse(&record.private_key_nsec)
+            let agent_keys = Keys::parse(&record_out.private_key_nsec)
                 .map_err(|e| format!("failed to parse agent keys: {e}"))?;
             // Re-publish the renamed profile to the agent's effective relay:
             // an explicit per-agent relay wins; empty falls back to workspace.
             let relay_url = crate::relay::effective_agent_relay_url(
-                &record.relay_url,
+                &record_out.relay_url,
                 &relay_ws_url_with_override(&state),
             );
-            let display_name = record.name.clone();
+            let display_name = record_out.name.clone();
             // Avatar fallback derives from the EFFECTIVE harness (persona-wins),
             // not the frozen snapshot, so an inherited harness picks the right
             // default avatar.
             let personas = load_personas(&app).unwrap_or_default();
-            let effective_command = crate::managed_agents::record_agent_command(record, &personas);
-            let avatar_url = record
+            let effective_command =
+                crate::managed_agents::record_agent_command(&record_out, &personas);
+            let avatar_url = record_out
                 .avatar_url
                 .clone()
                 .or_else(|| managed_agent_avatar_url(&effective_command));
-            let auth_tag = record.auth_tag.clone();
+            let auth_tag = record_out.auth_tag.clone();
             Some((agent_keys, relay_url, display_name, avatar_url, auth_tag))
         } else {
             None
@@ -972,14 +1077,14 @@ pub async fn update_managed_agent(
             let personas = load_personas(&app).unwrap_or_default();
             build_managed_agent_summary(
                 &app,
-                record,
+                &record_out,
                 &runtimes,
                 &personas,
                 &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
             )?
         };
-        let rollback = name_changed.then(|| AgentUpdateRollback::new(previous_record, record));
-        (summary, sync_params, rollback)
+        let rollback = name_changed.then(|| AgentUpdateRollback::new(previous_record, &record_out));
+        (summary, sync_params, rollback, op_id)
     }; // lock dropped here
 
     try_regenerate_nest(&app);

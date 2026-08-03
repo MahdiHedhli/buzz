@@ -79,18 +79,18 @@ pub(super) fn rollback_failed_agent_update(
     rollback: AgentUpdateRollback,
 ) -> Result<(), String> {
     {
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
         let mut records = load_managed_agents(app)?;
         restore_agent_update(&mut records, pubkey, rollback)?;
-        save_managed_agents(app, &records)?;
+        let _store_guard = save_managed_agents(app, store_guard, &records)?;
         let restored = records
             .iter()
             .find(|record| record.pubkey == pubkey)
             .ok_or_else(|| format!("agent {pubkey} not found after failed rename rollback"))?;
-        super::agents::retain_managed_agent_pending(app, state, restored);
+        super::agents::retain_managed_agent_pending(app, state, restored, None);
     }
     try_regenerate_nest(app);
     Ok(())

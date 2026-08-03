@@ -278,6 +278,12 @@ fn load_agent_store(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> 
 /// Load the keyed agent *instances*. Key-less definitions (former personas,
 /// folded into the same store) are filtered out so every pre-fold call site
 /// keeps seeing exactly the records it always did.
+///
+/// NOTE: This function acquires and immediately releases the OS advisory lock.
+/// For read-only contexts where the in-process mutex is already held, this is
+/// safe.  For any path that follows with a `save_managed_agents` call, use
+/// `mutate_managed_agents` instead so the OS lock is held across the full
+/// read → mutate → write sequence.
 pub fn load_managed_agents(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> {
     let mut records = load_agent_store(app)?;
     records.retain(|record| !record.pubkey.is_empty());
@@ -377,14 +383,28 @@ fn hydrate_keys_with(store: &impl KeyStore, records: &mut [ManagedAgentRecord]) 
 /// Save the keyed agent *instances*, preserving the key-less definitions that
 /// share the unified store.
 ///
-/// Holds the B1 advisory lock for the full read-merge-write sequence:
-/// reads the definition half under lock, merges with the supplied instances,
-/// and writes the unified store atomically.
-pub fn save_managed_agents(app: &AppHandle, records: &[ManagedAgentRecord]) -> Result<(), String> {
-    let mut sorted = records.to_vec();
-    // A caller-supplied key-less record would collide with the definition
-    // half; instances always carry a pubkey.
-    sorted.retain(|record| !record.pubkey.is_empty());
+/// Holds the B1 advisory lock for the full fresh-read → merge → write sequence
+/// via `mutate_store`.  The `store_mutex_guard` (in-process mutex) must already
+/// be held by the caller; it is returned after the file write so that post-write
+/// work (retain, tombstone) can still run inside the in-process lock.
+///
+/// **Callers that load first and then save should use `mutate_managed_agents`
+/// or `mutate_agent_store` instead**, so the mutation runs on the freshly-decoded
+/// state under the held OS advisory lock.  Using `save_managed_agents` after a
+/// separate `load_managed_agents` still leaves a window between the load and the
+/// save where another process can write; it is kept here for call sites where the
+/// caller's copy is authoritative (e.g. initialisation paths that build the vec
+/// from scratch) and for incremental migration.
+pub fn save_managed_agents<'g>(
+    app: &AppHandle,
+    store_mutex_guard: std::sync::MutexGuard<'g, ()>,
+    records: &[ManagedAgentRecord],
+) -> Result<std::sync::MutexGuard<'g, ()>, String> {
+    let mut sorted: Vec<ManagedAgentRecord> = records
+        .iter()
+        .filter(|r| !r.pubkey.is_empty())
+        .cloned()
+        .collect();
     sorted.sort_by(|left, right| {
         left.name
             .to_lowercase()
@@ -392,82 +412,178 @@ pub fn save_managed_agents(app: &AppHandle, records: &[ManagedAgentRecord]) -> R
             .then_with(|| left.pubkey.cmp(&right.pubkey))
     });
 
-    // Persist each key to the keyring; on success blank the inline copy so it
-    // is skipped from JSON (`skip_serializing_if = "String::is_empty"`). If the
-    // keyring is unreachable, the key stays inline.
+    // Persist keys to keyring; blank inline copies on success.
     persist_agent_keys(&mut sorted);
 
-    // Acquire advisory lock once for the full read-merge-write sequence so the
-    // definition half is never stale relative to the instance write.
-    write_agent_store_half(app, &sorted, /* keep_instances */ false)
+    // Use mutate_store so the OS advisory lock spans fresh-decode → merge → write.
+    let instances = sorted;
+    let (_, guard) =
+        crate::managed_agents::store_journal::mutate_store(app, store_mutex_guard, move |st| {
+            // Preserve the definition half exactly as decoded; replace the instance half.
+            let mut defs: Vec<ManagedAgentRecord> = st
+                .agents
+                .into_iter()
+                .filter(|r| r.pubkey.is_empty())
+                .collect();
+            defs.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+            let mut all = defs;
+            all.extend(instances);
+            // teams unchanged
+            let teams = st.teams;
+            Ok((all, teams, ()))
+        })?;
+    Ok(guard)
 }
 
 /// Save the key-less agent *definitions*, preserving the keyed instances —
 /// the definition-side mirror of [`save_managed_agents`].
-///
-/// Holds the B1 advisory lock for the full read-merge-write sequence.
-pub(crate) fn save_agent_definitions(
+pub(crate) fn save_agent_definitions<'g>(
     app: &AppHandle,
+    store_mutex_guard: std::sync::MutexGuard<'g, ()>,
     definitions: &[ManagedAgentRecord],
-) -> Result<(), String> {
-    let mut defs = definitions.to_vec();
-    defs.retain(|record| record.pubkey.is_empty());
-    write_agent_store_half(app, &defs, /* keep_instances */ true)
+) -> Result<std::sync::MutexGuard<'g, ()>, String> {
+    let defs: Vec<ManagedAgentRecord> = definitions
+        .iter()
+        .filter(|r| r.pubkey.is_empty())
+        .cloned()
+        .collect();
+
+    let (_, guard) =
+        crate::managed_agents::store_journal::mutate_store(app, store_mutex_guard, move |st| {
+            let mut sorted_defs = defs;
+            sorted_defs.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+            // Preserve the instance half exactly as decoded; replace the definition half.
+            let mut instances: Vec<ManagedAgentRecord> = st
+                .agents
+                .into_iter()
+                .filter(|r| !r.pubkey.is_empty())
+                .collect();
+            instances.sort_by(|a, b| {
+                a.name
+                    .to_lowercase()
+                    .cmp(&b.name.to_lowercase())
+                    .then_with(|| a.pubkey.cmp(&b.pubkey))
+            });
+
+            let mut all = sorted_defs;
+            all.extend(instances);
+            let teams = st.teams;
+            Ok((all, teams, ()))
+        })?;
+    Ok(guard)
 }
 
-/// Write `records` as either the instance or definition half of the unified
-/// store. Acquires the advisory lock, fresh-decodes the complementary half,
-/// merges, and writes atomically so neither half is ever stale.
-fn write_agent_store_half(
+/// Atomically mutate the **instance** half of the agent store via a closure,
+/// holding the OS advisory lock across fresh-decode → mutation → write.
+///
+/// `mutation` receives the full current instance list (key-bearing records)
+/// hydrated with keyring keys, and returns a modified instance list plus an
+/// arbitrary result value `T`.  The definition half is preserved exactly.
+///
+/// Returns `(T, guard)` so the caller can perform post-write work (retain,
+/// tombstone, cascade) while still holding the in-process mutex.
+pub fn mutate_agent_store<'g, F, T>(
     app: &AppHandle,
-    records: &[ManagedAgentRecord],
-    keep_instances: bool,
-) -> Result<(), String> {
-    let anchor = crate::managed_agents::store_journal::store_anchor_dir(app)?;
-    fs::create_dir_all(&anchor).map_err(|e| format!("failed to create anchor dir: {e}"))?;
-
-    // Acquire the interprocess advisory lock.
-    let _advisory = crate::managed_agents::store_journal::JournalLockGuard::acquire(&anchor)?;
-
-    let agents_path = anchor.join("managed-agents.json");
-
-    // Fresh decode under the lock so the complementary half is consistent.
-    let existing = load_agent_store_locked(&anchor, &agents_path).unwrap_or_default();
-
-    let (mut definitions, mut instances): (Vec<_>, Vec<_>) =
-        existing.into_iter().partition(|r| r.pubkey.is_empty());
-
-    if keep_instances {
-        definitions = records
-            .iter()
-            .filter(|r| r.pubkey.is_empty())
-            .cloned()
-            .collect();
-    } else {
-        instances = records
+    store_mutex_guard: std::sync::MutexGuard<'g, ()>,
+    mutation: F,
+) -> Result<(T, std::sync::MutexGuard<'g, ()>), String>
+where
+    F: FnOnce(
+        Vec<ManagedAgentRecord>,
+        &rusqlite::Connection,
+    ) -> Result<(Vec<ManagedAgentRecord>, T), String>,
+{
+    crate::managed_agents::store_journal::mutate_store(app, store_mutex_guard, move |st| {
+        let mut instances: Vec<ManagedAgentRecord> = st
+            .agents
             .iter()
             .filter(|r| !r.pubkey.is_empty())
             .cloned()
             .collect();
-    }
+        // Hydrate keys from keyring before presenting to the caller.
+        hydrate_keys(&mut instances);
 
-    definitions.sort_by(|left, right| left.slug.cmp(&right.slug));
-    instances.sort_by(|left, right| {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then_with(|| left.pubkey.cmp(&right.pubkey))
-    });
+        let defs: Vec<ManagedAgentRecord> = st
+            .agents
+            .into_iter()
+            .filter(|r| r.pubkey.is_empty())
+            .collect();
+        let teams = st.teams;
 
-    let mut all = definitions;
-    all.extend(instances);
+        let (mut new_instances, result) = mutation(instances, st.journal)?;
 
-    let payload = serde_json::to_vec_pretty(&all)
-        .map_err(|error| format!("failed to serialize agent store: {error}"))?;
+        // Persist keys, sort.
+        persist_agent_keys(&mut new_instances);
+        new_instances.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.pubkey.cmp(&b.pubkey))
+        });
 
-    // `managed-agents.json` carries plaintext agent nsecs in the keyringless
-    // fallback — write owner-only with fsync before rename.
-    crate::managed_agents::store_journal::atomic_write_restricted_with_fsync(&agents_path, &payload)
+        let mut all_defs = defs;
+        all_defs.sort_by(|a, b| a.slug.cmp(&b.slug));
+        let mut all = all_defs;
+        all.extend(new_instances);
+
+        Ok((all, teams, result))
+    })
+}
+
+/// Atomically mutate a single agent instance by pubkey, holding the OS
+/// advisory lock across fresh-decode → find → update → write.
+///
+/// Returns `(modified_record_clone, guard)` on success.  Returns `Err` when
+/// the agent is not found or the decode fails.
+pub fn mutate_managed_agent<'g, F, T>(
+    app: &AppHandle,
+    store_mutex_guard: std::sync::MutexGuard<'g, ()>,
+    pubkey: &str,
+    update: F,
+) -> Result<(ManagedAgentRecord, T, std::sync::MutexGuard<'g, ()>), String>
+where
+    F: FnOnce(&mut ManagedAgentRecord, &rusqlite::Connection) -> Result<T, String>,
+{
+    let pubkey = pubkey.to_owned();
+    mutate_agent_store(app, store_mutex_guard, move |mut instances, journal| {
+        let record = instances
+            .iter_mut()
+            .find(|r| r.pubkey == pubkey)
+            .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        let extra = update(record, journal)?;
+        let record_clone = record.clone();
+        Ok((instances, (record_clone, extra)))
+    })
+    .map(|((record_clone, extra), guard)| (record_clone, extra, guard))
+}
+
+/// Atomically mutate the **team** half of the store via a closure, holding the
+/// OS advisory lock across fresh-decode → mutation → write of both JSON files.
+///
+/// `mutation` receives the full current team list and the open journal
+/// connection, and returns a modified team list plus an arbitrary result
+/// value `T`.  The agents half is preserved exactly (pass-through).
+///
+/// Returns `(T, guard)` so the caller can perform post-write work while still
+/// holding the in-process mutex.
+pub fn mutate_team_store<'g, F, T>(
+    app: &AppHandle,
+    store_mutex_guard: std::sync::MutexGuard<'g, ()>,
+    mutation: F,
+) -> Result<(T, std::sync::MutexGuard<'g, ()>), String>
+where
+    F: FnOnce(
+        Vec<crate::managed_agents::TeamRecord>,
+        &rusqlite::Connection,
+    ) -> Result<(Vec<crate::managed_agents::TeamRecord>, T), String>,
+{
+    crate::managed_agents::store_journal::mutate_store(app, store_mutex_guard, move |st| {
+        let agents = st.agents;
+        let (new_teams, result) = mutation(st.teams, st.journal)?;
+        Ok((agents, new_teams, result))
+    })
 }
 
 /// Write each record's in-memory key to the keyring and blank the inline copy
@@ -480,6 +596,12 @@ fn persist_agent_keys(records: &mut [ManagedAgentRecord]) {
         return;
     };
     persist_agent_keys_with(store, records);
+}
+
+/// Public wrapper around [`persist_agent_keys`] for callers that build their
+/// own record lists inside a `mutate_store` closure (e.g. `team_snapshot.rs`).
+pub fn persist_agent_keys_pub(records: &mut [ManagedAgentRecord]) {
+    persist_agent_keys(records);
 }
 
 /// Testable core of [`persist_agent_keys`], generic over the [`KeyStore`] seam.

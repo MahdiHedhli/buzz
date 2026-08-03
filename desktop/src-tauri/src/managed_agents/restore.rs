@@ -39,7 +39,7 @@ type AgentSpawnResult = (String, SpawnOutcome);
 /// `effective_config::resolve_effective_config`'s `OrphanedInstance` arm).
 pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
@@ -78,7 +78,7 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
     }
 
     if changed {
-        save_managed_agents(app, &records)?;
+        let _store_guard = save_managed_agents(app, store_guard, &records)?;
     }
     Ok(())
 }
@@ -102,7 +102,7 @@ pub async fn restore_managed_agents_on_launch(
     // ── Phase A (under lock): housekeeping + collect agents to restore ──
     let mut agents_to_start: Vec<super::ManagedAgentRecord>;
     {
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
@@ -220,7 +220,7 @@ pub async fn restore_managed_agents_on_launch(
             .collect();
 
         if changed {
-            save_managed_agents(app, &records)?;
+            let _store_guard = save_managed_agents(app, store_guard, &records)?;
         }
     }
 
@@ -359,7 +359,7 @@ pub async fn restore_managed_agents_on_launch(
     }
 
     // ── Phase C (re-acquire lock): write back PIDs and status to records ──
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
@@ -444,9 +444,9 @@ pub async fn restore_managed_agents_on_launch(
             })
             .collect();
 
-    save_managed_agents(app, &records)?;
+    let store_guard = save_managed_agents(app, store_guard, &records)?;
     drop(runtimes);
-    drop(_store_guard);
+    drop(store_guard);
     drop(restore_transition);
 
     // ── Profile reconciliation (fire-and-forget) ────────────────────────────
@@ -475,7 +475,7 @@ fn persist_restore_error(
     pubkey: &str,
     error: String,
 ) -> Result<(), String> {
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
@@ -483,5 +483,5 @@ fn persist_restore_error(
     let record = find_managed_agent_mut(&mut records, pubkey)?;
     record.updated_at = util::now_iso();
     record.last_error = Some(error);
-    save_managed_agents(app, &records)
+    save_managed_agents(app, store_guard, &records).map(|_| ())
 }

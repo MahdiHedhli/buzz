@@ -209,6 +209,7 @@ pub struct RelayAgentInfo {
     pub respond_to_allowlist: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedAgentRecord {
     pub pubkey: String,
     pub name: String,
@@ -761,6 +762,7 @@ pub struct AgentModelInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TeamRecord {
     pub id: String,
     pub name: String,

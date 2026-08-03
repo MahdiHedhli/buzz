@@ -96,7 +96,7 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             let model = trim_optional(input.model);
             let provider = trim_optional(input.provider);
 
-            let _store_guard = state
+            let store_guard = state
                 .managed_agents_store_lock
                 .lock()
                 .map_err(|error| error.to_string())?;
@@ -203,7 +203,7 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                 }
 
                 if agents_modified {
-                    save_managed_agents(&app, &records)?;
+                    let _store_guard = save_managed_agents(&app, store_guard, &records)?;
                     // Keep retained kind:30177 identity records in lockstep with
                     // the rename (#2423): `record.name` is part of the published
                     // identity projection, so skipping this strands the relay on
@@ -211,7 +211,9 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                     // Avatar-only edits are excluded — the avatar is not in the
                     // projection, so retaining would be a guaranteed no-op.
                     for record in records.iter().filter(|r| renamed.contains(&r.pubkey)) {
-                        crate::commands::agents::retain_managed_agent_pending(&app, &state, record);
+                        crate::commands::agents::retain_managed_agent_pending(
+                            &app, &state, record, None,
+                        );
                     }
                 }
 

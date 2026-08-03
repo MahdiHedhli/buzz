@@ -68,6 +68,15 @@ pub fn migrate_personas_to_events(app: &tauri::AppHandle, keys: &nostr::Keys, db
         return;
     };
 
+    // Acquire the B1 advisory lock so this read-only pass is serialised
+    // against concurrent writers from other processes.  Best-effort: a lock
+    // failure falls through to the read (advisory protection only).
+    let _advisory = crate::managed_agents::store_journal::store_anchor_dir(app)
+        .ok()
+        .and_then(|anchor| {
+            crate::managed_agents::store_journal::JournalLockGuard::acquire(&anchor).ok()
+        });
+
     match migrate_personas_in_dir_at(&base_dir, keys, db_path) {
         Ok(0) => {}
         Ok(migrated) => {
@@ -226,6 +235,15 @@ pub fn migrate_teams_to_events(app: &tauri::AppHandle, keys: &nostr::Keys, db_pa
     let Ok(base_dir) = managed_agents_base_dir(app) else {
         return;
     };
+
+    // Acquire the B1 advisory lock so this read-only pass is serialised
+    // against concurrent writers from other processes.  Best-effort: a lock
+    // failure falls through to the read (advisory protection only).
+    let _advisory = crate::managed_agents::store_journal::store_anchor_dir(app)
+        .ok()
+        .and_then(|anchor| {
+            crate::managed_agents::store_journal::JournalLockGuard::acquire(&anchor).ok()
+        });
 
     match migrate_teams_in_dir_at(&base_dir, keys, db_path) {
         Ok(0) => {}

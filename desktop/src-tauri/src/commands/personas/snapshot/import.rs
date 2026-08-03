@@ -542,7 +542,7 @@ pub async fn confirm_agent_snapshot_import(
 
     // ── Phase 3a: create AgentDefinition + ManagedAgentRecord (sync lock) ──────
     let (persona, record) = {
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
@@ -657,7 +657,7 @@ pub async fn confirm_agent_snapshot_import(
         };
 
         records.push(record.clone());
-        save_managed_agents(&app, &records)?;
+        let _store_guard = save_managed_agents(&app, store_guard, &records)?;
 
         // Enqueue the kind:30177 managed-agent event via retention.
         // (Uses the same pattern as agents.rs::retain_managed_agent_pending

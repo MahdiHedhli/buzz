@@ -485,10 +485,21 @@ fn copy_file_over_generated_default(src: &Path, dst: &Path) -> std::io::Result<(
 /// Read a JSON array of objects from `path`, apply `f` to each object,
 /// and write back with `atomic_write_restricted_with_fsync` if any mutation
 /// returned `true`.
+///
+/// Acquires the B1 advisory lock for `anchor` before reading/writing so this
+/// migration patch is serialized against concurrent processes.
 fn patch_json_records(
     path: &Path,
+    anchor: &Path,
     mut f: impl FnMut(&mut serde_json::Map<String, serde_json::Value>) -> bool,
 ) {
+    let _advisory = match crate::managed_agents::store_journal::JournalLockGuard::acquire(anchor) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("buzz-desktop: patch-json-records: failed to acquire advisory lock: {e}");
+            return;
+        }
+    };
     let Ok(content) = std::fs::read_to_string(path) else {
         return;
     };
@@ -709,7 +720,7 @@ fn uploaded_media_sha256(avatar_url: &str) -> Option<String> {
 
 fn persona_version_from_record(record: &serde_json::Value) -> Option<String> {
     let record: crate::managed_agents::ManagedAgentRecord =
-        serde_json::from_value(record.clone()).ok()?;
+        crate::managed_agents::store_journal::decode_agent_record_permissive(record.clone())?;
     let definition = record.to_definition_view()?;
     Some(crate::managed_agents::persona_events::persona_content_hash(
         &crate::managed_agents::persona_events::persona_event_content(&definition),
@@ -833,6 +844,20 @@ pub fn sync_shared_agent_data(app: &tauri::AppHandle) {
         );
         return;
     }
+
+    // Acquire the B1 advisory lock on the canonical agents anchor directory
+    // so this migration step is serialized against other boot processes that
+    // might simultaneously set up their symlinks or write to the store.
+    let canonical_agents_dir = canonical_dir.join("agents");
+    let _advisory = match crate::managed_agents::store_journal::JournalLockGuard::acquire(
+        &canonical_agents_dir,
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("buzz-desktop: shared-agent-sync: advisory lock failed: {e}");
+            return;
+        }
+    };
 
     // Seed-up: if canonical is missing a shared file but a sibling instance
     // holds real (non-symlink) content, migrate it up to canonical before the
@@ -979,7 +1004,7 @@ fn reconcile_mcp_commands_in_file(path: &Path) {
     // from the sibling personas.json; missing entries fall back to the record's
     // own agent_command (the create-time snapshot).
     let persona_runtimes = load_persona_runtimes(path);
-    patch_json_records(path, |obj| {
+    patch_json_records(path, path.parent().unwrap_or(path), |obj| {
         let override_cmd = obj
             .get("agent_command_override")
             .and_then(|v| v.as_str())
@@ -1050,7 +1075,7 @@ fn replace_command_field(
 }
 
 fn reconcile_legacy_command_names_in_file(path: &Path) {
-    patch_json_records(path, |obj| {
+    patch_json_records(path, path.parent().unwrap_or(path), |obj| {
         let mut changed = false;
 
         if let Some(acp_command) = obj
@@ -1100,7 +1125,7 @@ fn reconcile_legacy_command_names_in_file(path: &Path) {
 }
 
 fn reconcile_legacy_persona_runtimes_in_file(path: &Path) {
-    patch_json_records(path, |obj| {
+    patch_json_records(path, path.parent().unwrap_or(path), |obj| {
         let Some(runtime) = obj.get("runtime").and_then(|v| v.as_str()) else {
             return false;
         };
@@ -1237,7 +1262,7 @@ pub fn reconcile_provider_mcp_commands(app: &tauri::AppHandle) {
 
 fn reconcile_databricks_v1_to_v2_in_file(path: &Path, rewrite_v1_provider: bool) {
     use crate::managed_agents::is_derived_provider_model_key;
-    patch_json_records(path, |obj| {
+    patch_json_records(path, path.parent().unwrap_or(path), |obj| {
         let mut changed = false;
 
         // Only rewrite the structured provider field when the baked build env
@@ -1344,7 +1369,7 @@ pub fn reconcile_databricks_v1_to_v2(app: &tauri::AppHandle) {
 }
 
 fn rename_provider_to_runtime_in_personas(path: &Path) {
-    patch_json_records(path, |obj| {
+    patch_json_records(path, path.parent().unwrap_or(path), |obj| {
         if obj.contains_key("runtime") {
             return false;
         }

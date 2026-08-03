@@ -364,6 +364,7 @@ pub(crate) fn load_personas_from_path(
 }
 
 pub fn save_personas(app: &AppHandle, records: &[AgentDefinition]) -> Result<(), String> {
+    use tauri::Manager;
     let mut sorted = records.to_vec();
     sort_personas(&mut sorted);
 
@@ -373,7 +374,38 @@ pub fn save_personas(app: &AppHandle, records: &[AgentDefinition]) -> Result<(),
         .into_iter()
         .map(|persona| persona.into_agent_record())
         .collect();
-    crate::managed_agents::storage::save_agent_definitions(app, &definitions)
+
+    // Acquire the in-process store lock here; callers that already hold it
+    // must NOT call this function — they should call save_agent_definitions
+    // directly to avoid deadlocking on the non-reentrant mutex.
+    let state = app.state::<crate::app_state::AppState>();
+    let guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| format!("failed to acquire store lock in save_personas: {e}"))?;
+    crate::managed_agents::storage::save_agent_definitions(app, guard, &definitions).map(|_| ())
+}
+
+/// Save persona definitions under an already-held in-process store lock.
+///
+/// Use this instead of [`save_personas`] when the caller already holds
+/// `managed_agents_store_lock` — `save_personas` acquires the lock itself and
+/// will deadlock if called with it held (Rust `Mutex` is not re-entrant).
+///
+/// Returns the store guard so callers can continue holding the lock after the
+/// write.
+pub(crate) fn save_personas_locked<'g>(
+    app: &AppHandle,
+    store_guard: std::sync::MutexGuard<'g, ()>,
+    records: &[AgentDefinition],
+) -> Result<std::sync::MutexGuard<'g, ()>, String> {
+    let mut sorted = records.to_vec();
+    sort_personas(&mut sorted);
+    let definitions: Vec<_> = sorted
+        .into_iter()
+        .map(|persona| persona.into_agent_record())
+        .collect();
+    crate::managed_agents::storage::save_agent_definitions(app, store_guard, &definitions)
 }
 
 #[cfg(test)]

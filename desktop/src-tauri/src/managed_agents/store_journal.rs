@@ -46,8 +46,15 @@ const ADVISORY_LOCK_FILENAME: &str = "store-journal.lock";
 /// Resolve the store-family anchor directory.
 ///
 /// For shared dev worktrees (`BUZZ_SHARE_IDENTITY=1`): the canonical dev
-/// `agents/` dir (falls back to local if absent).  For standalone:
-/// `app_data_dir()/agents`.  Never derived from `managed-agents.json`.
+/// `agents/` dir, returned **unconditionally** regardless of whether it
+/// exists yet.  Lock acquisition calls `create_dir_all`, so absent-on-first-
+/// boot is not a reason to fall back.  Falling back on absence would let two
+/// simultaneous first-boot processes each choose their own local dir, giving
+/// them different lock/journal authorities and making shared-state recovery
+/// impossible (v34.1 §1).
+///
+/// For standalone: `app_data_dir()/agents`.  Never derived from
+/// `managed-agents.json` — an absent file must never determine lock identity.
 pub fn store_anchor_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let local_agents = app
         .path()
@@ -62,9 +69,9 @@ pub fn store_anchor_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
     if is_shared {
         if let Some(anchor) = canonical_dev_anchor(&local_agents) {
-            if anchor.exists() {
-                return Ok(anchor);
-            }
+            // Return the canonical dev path UNCONDITIONALLY — do not branch on
+            // anchor.exists().  Lock acquisition will create the directory.
+            return Ok(anchor);
         }
     }
 
@@ -147,12 +154,12 @@ impl JournalLockGuard {
                 .collect();
             let handle = unsafe {
                 windows_sys::Win32::System::Threading::CreateMutexW(
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
                     0,
                     name.as_ptr(),
                 )
             };
-            if handle == 0 || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
                 return Err(format!("CreateMutexW failed for journal lock"));
             }
             let wait = unsafe {
@@ -217,11 +224,6 @@ pub fn apply_journal_schema_pub(conn: &Connection) -> Result<(), String> {
 fn apply_journal_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS schema_version (
-            version INTEGER NOT NULL
-        );
-        INSERT OR IGNORE INTO schema_version VALUES (0);
-
         -- Per-key generation / tombstone metadata.
         -- generation stored as TEXT to preserve full u64 range.
         -- is_tombstone=1: key deleted; generation kept forever (no GC).
@@ -249,14 +251,17 @@ fn apply_journal_schema(conn: &Connection) -> Result<(), String> {
             updated_at   INTEGER NOT NULL
         );
 
-        -- Immutable outbox rows (written once, never updated).
-        -- published: 0=pending, 1=published, 2=uncertain, 3=accepted.
+        -- Immutable outbox rows (written once; publication progress tracked
+        -- via append-only operation/event phase transitions, not a mutable
+        -- flag).
+        -- published_state: 0=pending, 1=published, 2=uncertain, 3=accepted.
+        -- Advancing published_state is a fenced CAS; see mark_outbox_published.
         CREATE TABLE IF NOT EXISTS outbox_events (
             event_id     TEXT NOT NULL PRIMARY KEY,
             operation_id TEXT NOT NULL
                 REFERENCES operations(operation_id),
             payload      BLOB NOT NULL,
-            published    INTEGER NOT NULL DEFAULT 0,
+            published_state INTEGER NOT NULL DEFAULT 0,
             created_at   INTEGER NOT NULL
         );
 
@@ -272,6 +277,11 @@ fn apply_journal_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("apply journal schema: {e}"))?;
 
+    // Set schema version via PRAGMA user_version (authoritative singleton,
+    // never duplicated).
+    conn.pragma_update(None, "user_version", 1)
+        .map_err(|e| format!("set schema user_version: {e}"))?;
+
     Ok(())
 }
 
@@ -281,13 +291,15 @@ fn apply_journal_schema(conn: &Connection) -> Result<(), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Generation(pub u64);
 
-#[allow(dead_code)]
 impl Generation {
     pub fn zero() -> Self {
         Generation(0)
     }
-    pub fn next(self) -> Self {
-        Generation(self.0.saturating_add(1))
+    pub fn next(self) -> Result<Self, String> {
+        self.0
+            .checked_add(1)
+            .map(Generation)
+            .ok_or_else(|| format!("generation overflow at {}: CAS cannot advance", self.0))
     }
     fn from_str(s: &str) -> Result<Self, String> {
         s.parse::<u64>()
@@ -300,7 +312,6 @@ impl Generation {
 }
 
 /// Outcome of a generation CAS attempt.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CasOutcome {
     /// CAS succeeded; `new_generation` is the committed value.
@@ -314,7 +325,6 @@ pub enum CasOutcome {
 
 /// Read the current generation for `key_id`.
 /// Returns `(Generation::zero(), false)` when no row exists.
-#[allow(dead_code)]
 pub fn read_generation(conn: &Connection, key_id: &str) -> Result<(Generation, bool), String> {
     let row: Option<(String, bool)> = conn
         .query_row(
@@ -336,7 +346,6 @@ pub fn read_generation(conn: &Connection, key_id: &str) -> Result<(Generation, b
 /// If `expected` matches the stored generation (or key is absent and
 /// `expected` is zero), advance to `expected.next()` and return
 /// `CasOutcome::Committed`.  Tombstoned keys return `CasOutcome::Tombstoned`.
-#[allow(dead_code)]
 pub fn cas_generation(
     conn: &Connection,
     key_id: &str,
@@ -354,7 +363,7 @@ pub fn cas_generation(
         return Ok(CasOutcome::Conflict { current });
     }
 
-    let new_gen = expected.next();
+    let new_gen = expected.next()?;
     let now = unix_now_secs();
     conn.execute(
         "INSERT INTO key_generations (key_id, generation, is_tombstone, updated_at)
@@ -374,7 +383,6 @@ pub fn cas_generation(
 
 /// Write a tombstone for `key_id` at `expected` generation.
 /// Kept forever; `cas_generation` respects it to prevent ABA.
-#[allow(dead_code)]
 pub fn tombstone_key(
     conn: &Connection,
     key_id: &str,
@@ -392,7 +400,7 @@ pub fn tombstone_key(
         return Ok(CasOutcome::Conflict { current });
     }
 
-    let tombstone_gen = expected.next();
+    let tombstone_gen = expected.next()?;
     let now = unix_now_secs();
     conn.execute(
         "INSERT INTO key_generations (key_id, generation, is_tombstone, updated_at)
@@ -426,7 +434,6 @@ pub enum Disposition {
     Accepted,
 }
 
-#[allow(dead_code)]
 impl Disposition {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -455,6 +462,7 @@ impl Disposition {
 
     /// True when the operation is in a terminal state requiring no further
     /// progression.
+    #[allow(dead_code)]
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -464,6 +472,7 @@ impl Disposition {
 
     /// True when the operation may require a nonterminal follow-up check
     /// (uncertain or accepted publication outcome).
+    #[allow(dead_code)]
     pub fn requires_follow_up(&self) -> bool {
         matches!(self, Disposition::Uncertain | Disposition::Accepted)
     }
@@ -471,23 +480,26 @@ impl Disposition {
 
 /// A record from the `operations` table.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct OperationRecord {
     pub operation_id: String,
     pub kind: String,
     pub key_id: String,
     pub disposition: Disposition,
+    /// Current committed generation at operation record time.
+    #[allow(dead_code)]
     pub generation: Generation,
     /// UUID of the active compensation event, if in `Compensating` state.
+    #[allow(dead_code)]
     pub compensation_id: Option<String>,
     /// Generation snapshot at compensation start.
+    #[allow(dead_code)]
     pub compensation_generation: Option<Generation>,
     /// Whether a nonterminal follow-up is pending (uncertain/accepted publication).
+    #[allow(dead_code)]
     pub nonterminal_follow_up: bool,
 }
 
 /// Insert a new `pending` operation record.
-#[allow(dead_code)]
 pub fn insert_operation(
     conn: &Connection,
     operation_id: &str,
@@ -507,7 +519,6 @@ pub fn insert_operation(
 }
 
 /// Read one operation record.  Returns `None` when not found.
-#[allow(dead_code)]
 #[allow(clippy::type_complexity)]
 pub fn read_operation(
     conn: &Connection,
@@ -566,71 +577,130 @@ pub fn read_operation(
     .transpose()
 }
 
-/// Advance an operation's disposition (no-op if not found).
-#[allow(dead_code)]
+/// Outcome of a fenced disposition transition.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TransitionOutcome {
+    /// Transition succeeded; operation is now in `new_disposition`.
+    Advanced,
+    /// The stored disposition did not match `expected_disposition`; the
+    /// operation is in `actual_disposition`.
+    Conflict { actual_disposition: String },
+    /// The operation was not found.
+    NotFound,
+}
+
+/// Advance an operation's disposition via SQL CAS on (operation_id,
+/// expected_disposition).  Requires exactly one affected row and reports
+/// `Conflict` or `NotFound` distinctly — never a silent no-op.
 pub fn advance_disposition(
     conn: &Connection,
     operation_id: &str,
+    expected_disposition: &Disposition,
     new_disposition: &Disposition,
-) -> Result<(), String> {
+) -> Result<TransitionOutcome, String> {
     let now = unix_now_secs();
-    conn.execute(
-        "UPDATE operations SET disposition = ?1, updated_at = ?2
-         WHERE operation_id = ?3",
-        params![new_disposition.as_str(), now, operation_id],
-    )
-    .map_err(|e| format!("advance_disposition({operation_id}): {e}"))?;
-    Ok(())
+    let affected = conn
+        .execute(
+            "UPDATE operations SET disposition = ?1, updated_at = ?2
+             WHERE operation_id = ?3 AND disposition = ?4",
+            params![
+                new_disposition.as_str(),
+                now,
+                operation_id,
+                expected_disposition.as_str(),
+            ],
+        )
+        .map_err(|e| format!("advance_disposition({operation_id}): {e}"))?;
+
+    if affected == 1 {
+        return Ok(TransitionOutcome::Advanced);
+    }
+
+    // Distinguish NotFound from Conflict by reading the current row.
+    match read_operation(conn, operation_id)? {
+        None => Ok(TransitionOutcome::NotFound),
+        Some(op) => Ok(TransitionOutcome::Conflict {
+            actual_disposition: op.disposition.as_str().to_owned(),
+        }),
+    }
 }
 
 /// Pin the active compensation event for an operation (v10 claim fence).
-/// Only allowed when disposition is `Pending` (transitioning to `Compensating`).
+/// Only allowed when disposition is exactly `Pending` — transitions to
+/// `Compensating`.  Requires exactly one affected row.
 #[allow(dead_code)]
 pub fn pin_compensation(
     conn: &Connection,
     operation_id: &str,
     compensation_id: &str,
     compensation_generation: Generation,
-) -> Result<(), String> {
+) -> Result<TransitionOutcome, String> {
     let now = unix_now_secs();
-    conn.execute(
-        "UPDATE operations
-         SET disposition            = 'compensating',
-             compensation_id        = ?1,
-             compensation_generation = ?2,
-             updated_at             = ?3
-         WHERE operation_id = ?4",
-        params![
-            compensation_id,
-            compensation_generation.to_db_str(),
-            now,
-            operation_id,
-        ],
-    )
-    .map_err(|e| format!("pin_compensation({operation_id}): {e}"))?;
-    Ok(())
+    let affected = conn
+        .execute(
+            "UPDATE operations
+             SET disposition            = 'compensating',
+                 compensation_id        = ?1,
+                 compensation_generation = ?2,
+                 updated_at             = ?3
+             WHERE operation_id = ?4 AND disposition = 'pending'",
+            params![
+                compensation_id,
+                compensation_generation.to_db_str(),
+                now,
+                operation_id,
+            ],
+        )
+        .map_err(|e| format!("pin_compensation({operation_id}): {e}"))?;
+
+    if affected == 1 {
+        return Ok(TransitionOutcome::Advanced);
+    }
+
+    match read_operation(conn, operation_id)? {
+        None => Ok(TransitionOutcome::NotFound),
+        Some(op) => Ok(TransitionOutcome::Conflict {
+            actual_disposition: op.disposition.as_str().to_owned(),
+        }),
+    }
 }
 
 /// Mark that a nonterminal follow-up is required (uncertain/accepted
-/// publication outcome — v12).
+/// publication outcome — v12).  CAS on expected disposition.
 #[allow(dead_code)]
 pub fn set_nonterminal_follow_up(
     conn: &Connection,
     operation_id: &str,
+    expected_disposition: &Disposition,
     required: bool,
-) -> Result<(), String> {
+) -> Result<TransitionOutcome, String> {
     let now = unix_now_secs();
-    conn.execute(
-        "UPDATE operations SET nonterminal_follow_up = ?1, updated_at = ?2
-         WHERE operation_id = ?3",
-        params![required as i64, now, operation_id],
-    )
-    .map_err(|e| format!("set_nonterminal_follow_up({operation_id}): {e}"))?;
-    Ok(())
+    let affected = conn
+        .execute(
+            "UPDATE operations SET nonterminal_follow_up = ?1, updated_at = ?2
+             WHERE operation_id = ?3 AND disposition = ?4",
+            params![
+                required as i64,
+                now,
+                operation_id,
+                expected_disposition.as_str(),
+            ],
+        )
+        .map_err(|e| format!("set_nonterminal_follow_up({operation_id}): {e}"))?;
+
+    if affected == 1 {
+        return Ok(TransitionOutcome::Advanced);
+    }
+
+    match read_operation(conn, operation_id)? {
+        None => Ok(TransitionOutcome::NotFound),
+        Some(op) => Ok(TransitionOutcome::Conflict {
+            actual_disposition: op.disposition.as_str().to_owned(),
+        }),
+    }
 }
 
 /// Read all non-terminal operations for recovery.
-#[allow(dead_code)]
 pub fn read_nonterminal_operations(conn: &Connection) -> Result<Vec<OperationRecord>, String> {
     let mut stmt = conn
         .prepare(
@@ -680,42 +750,117 @@ pub fn read_nonterminal_operations(conn: &Connection) -> Result<Vec<OperationRec
 
 // ── Immutable inbox / outbox rows ─────────────────────────────────────────────
 
-/// Insert an immutable outbox row.  The row is written once and never updated.
-#[allow(dead_code)]
+/// Outcome of an immutable-row insertion.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InsertEventOutcome {
+    /// New row inserted.
+    Inserted,
+    /// A row with this `event_id` already exists and is byte-identical
+    /// (safe exact-replay idempotency).
+    ExactDuplicate,
+    /// A row with this `event_id` already exists but has different
+    /// `operation_id` or `payload` — identity collision, fail closed.
+    IdentityCollision,
+}
+
+/// Insert an immutable outbox row.  Fail-closed on identity collision:
+/// a duplicate event_id is only accepted when operation_id and payload
+/// are byte-identical.
 pub fn insert_outbox_event(
     conn: &Connection,
     event_id: &str,
     operation_id: &str,
     payload: &[u8],
-) -> Result<(), String> {
+) -> Result<InsertEventOutcome, String> {
     let now = unix_now_secs();
-    conn.execute(
-        "INSERT OR IGNORE INTO outbox_events
-             (event_id, operation_id, payload, published, created_at)
-         VALUES (?1, ?2, ?3, 0, ?4)",
-        params![event_id, operation_id, payload, now],
-    )
-    .map_err(|e| format!("insert_outbox_event({event_id}): {e}"))?;
-    Ok(())
+    // Try an unconditional insert first.
+    let affected = conn
+        .execute(
+            "INSERT OR IGNORE INTO outbox_events
+                 (event_id, operation_id, payload, published_state, created_at)
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            params![event_id, operation_id, payload, now],
+        )
+        .map_err(|e| format!("insert_outbox_event({event_id}): {e}"))?;
+
+    if affected == 1 {
+        return Ok(InsertEventOutcome::Inserted);
+    }
+
+    // Row already exists — check identity.
+    let existing: Option<(String, Vec<u8>)> = conn
+        .query_row(
+            "SELECT operation_id, payload FROM outbox_events WHERE event_id = ?1",
+            params![event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("read existing outbox_event({event_id}): {e}"))?;
+
+    match existing {
+        Some((op, pl)) if op == operation_id && pl == payload => {
+            Ok(InsertEventOutcome::ExactDuplicate)
+        }
+        _ => Ok(InsertEventOutcome::IdentityCollision),
+    }
 }
 
-/// Insert an immutable inbox row.  The row is written once and never updated.
+/// Advance publication state of an outbox event via CAS on
+/// `expected_state → new_state`.  Requires exactly one affected row.
+#[allow(dead_code)]
+pub fn mark_outbox_published(
+    conn: &Connection,
+    event_id: &str,
+    expected_state: i64,
+    new_state: i64,
+) -> Result<bool, String> {
+    let affected = conn
+        .execute(
+            "UPDATE outbox_events SET published_state = ?1
+             WHERE event_id = ?2 AND published_state = ?3",
+            params![new_state, event_id, expected_state],
+        )
+        .map_err(|e| format!("mark_outbox_published({event_id}): {e}"))?;
+    Ok(affected == 1)
+}
+
+/// Insert an immutable inbox row.  Fail-closed on identity collision.
 #[allow(dead_code)]
 pub fn insert_inbox_event(
     conn: &Connection,
     event_id: &str,
     operation_id: &str,
     payload: &[u8],
-) -> Result<(), String> {
+) -> Result<InsertEventOutcome, String> {
     let now = unix_now_secs();
-    conn.execute(
-        "INSERT OR IGNORE INTO inbox_events
-             (event_id, operation_id, payload, received_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![event_id, operation_id, payload, now],
-    )
-    .map_err(|e| format!("insert_inbox_event({event_id}): {e}"))?;
-    Ok(())
+    let affected = conn
+        .execute(
+            "INSERT OR IGNORE INTO inbox_events
+                 (event_id, operation_id, payload, received_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![event_id, operation_id, payload, now],
+        )
+        .map_err(|e| format!("insert_inbox_event({event_id}): {e}"))?;
+
+    if affected == 1 {
+        return Ok(InsertEventOutcome::Inserted);
+    }
+
+    let existing: Option<(String, Vec<u8>)> = conn
+        .query_row(
+            "SELECT operation_id, payload FROM inbox_events WHERE event_id = ?1",
+            params![event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("read existing inbox_event({event_id}): {e}"))?;
+
+    match existing {
+        Some((op, pl)) if op == operation_id && pl == payload => {
+            Ok(InsertEventOutcome::ExactDuplicate)
+        }
+        _ => Ok(InsertEventOutcome::IdentityCollision),
+    }
 }
 
 /// Read outbox events for `operation_id`.
@@ -726,7 +871,7 @@ pub fn read_outbox_events(
 ) -> Result<Vec<(String, Vec<u8>, i64)>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT event_id, payload, published FROM outbox_events
+            "SELECT event_id, payload, published_state FROM outbox_events
              WHERE operation_id = ?1 ORDER BY created_at",
         )
         .map_err(|e| format!("prepare outbox query: {e}"))?;
@@ -792,10 +937,55 @@ pub fn decode_team_store(bytes: &[u8]) -> Result<Vec<TeamRecord>, StoreDecodeErr
     })
 }
 
+/// Leniently decode a single `ManagedAgentRecord` from a `serde_json::Value`
+/// that may contain unknown fields from a future schema version.
+///
+/// Intended for **read-only** migration helpers that compute hashes or
+/// inspect existing store records — not for decoding user-provided or
+/// externally-sourced data (use `decode_agent_store` for those paths).
+///
+/// Repeatedly strips unrecognized fields (identified from the serde error
+/// message) and retries until decode succeeds or we've exhausted 32 attempts.
+/// Returns `None` when the record is structurally invalid (missing required
+/// fields, wrong types) after stripping.
+pub fn decode_agent_record_permissive(mut v: serde_json::Value) -> Option<ManagedAgentRecord> {
+    for _ in 0..32 {
+        match serde_json::from_value::<ManagedAgentRecord>(v.clone()) {
+            Ok(r) => return Some(r),
+            Err(e) => {
+                // serde_json formats unknown-field errors as
+                // `unknown field `<NAME>`, expected ...`
+                let msg = e.to_string();
+                if let Some(name) = msg
+                    .strip_prefix("unknown field `")
+                    .and_then(|s| s.split('`').next())
+                {
+                    let field = name.to_string();
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.remove(&field);
+                    } else {
+                        return None;
+                    }
+                } else {
+                    // Not an unknown-field error (missing required field, type
+                    // mismatch, etc.) — cannot recover.
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+
 // ── Atomic write (with fsync) ─────────────────────────────────────────────────
 
-/// Write `payload` to `path` atomically (tmp → fsync → rename). Resolves
-/// symlinks so the rename lands on the physical target.
+/// Write `payload` to `path` atomically (tmp → fsync → rename → fsync-parent).
+/// Resolves symlinks so the rename lands on the physical target.
+///
+/// On Unix, fsyncs the parent directory after rename to durably commit the
+/// directory entry — without it the data blocks may survive a crash while the
+/// renamed entry does not.  This matches the durability guarantee provided by
+/// `atomic-write-file::commit()` on the restricted-write path.
 pub fn atomic_write_with_fsync(path: &Path, payload: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -808,7 +998,18 @@ pub fn atomic_write_with_fsync(path: &Path, payload: &[u8]) -> Result<(), String
         .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
     drop(file);
     std::fs::rename(&tmp, &resolved)
-        .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), resolved.display()))
+        .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), resolved.display()))?;
+
+    // Fsync the parent directory so the directory entry for the new name is
+    // durably committed.  Best-effort on platforms that do not support it.
+    #[cfg(unix)]
+    if let Some(parent) = resolved.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    Ok(())
 }
 
 /// Atomic write (tmp → fsync → rename) with `0o600` permissions. Used for
@@ -841,28 +1042,44 @@ pub fn atomic_write_restricted_with_fsync(path: &Path, payload: &[u8]) -> Result
 
 // ── Closure-only mutation API (v7) ────────────────────────────────────────────
 
-/// The decoded state passed to a mutation closure.
-#[allow(dead_code)]
+/// The decoded state passed to a mutation or read closure.
 pub struct StoreState<'a> {
-    /// Agent records decoded from `managed-agents.json`.
+    /// Agent records decoded from `managed-agents.json` (all records —
+    /// instances with a pubkey AND key-less definitions).
     pub agents: Vec<ManagedAgentRecord>,
     /// Team records decoded from `teams.json`.
     pub teams: Vec<TeamRecord>,
     /// Open journal connection (anchor-locked).
     pub journal: &'a Connection,
     /// Anchor directory (for constructing file paths).
+    #[allow(dead_code)]
     pub anchor: &'a Path,
 }
 
-/// Mutate the store under the full lock sequence (in-process mutex →
-/// advisory lock → fresh decode → mutation → atomic fsync write → release).
-/// Network I/O and keyring access must not occur inside `mutation`.
-#[allow(dead_code)]
-pub fn mutate_store<F, T>(
+/// Mutate the store under the full lock sequence:
+///
+///   in-process mutex (caller-held `store_mutex_guard`)
+///   → anchored OS advisory lock (acquired here)
+///   → fresh fail-closed decode
+///   → SQLite journal transaction (inside `mutation`)
+///   → atomic fsync write of both canonical JSON files
+///   → release OS advisory lock
+///
+/// The `store_mutex_guard` is **returned** so the caller can perform
+/// post-write work (e.g. `retain_managed_agent_pending`, which must run
+/// while the in-process mutex is still held) before dropping it.
+///
+/// Network I/O and keyring access must NOT occur inside `mutation`.  They
+/// belong outside the critical section, driven by durable operation phases
+/// that `mutation` records in the journal.
+///
+/// On any decode error inside this function no file is written, no journal
+/// transition occurs, and the error is propagated with `?`.
+pub fn mutate_store<'g, F, T>(
     app: &AppHandle,
-    store_mutex_guard: MutexGuard<'_, ()>,
+    store_mutex_guard: MutexGuard<'g, ()>,
     mutation: F,
-) -> Result<T, String>
+) -> Result<(T, MutexGuard<'g, ()>), String>
 where
     F: FnOnce(StoreState<'_>) -> Result<(Vec<ManagedAgentRecord>, Vec<TeamRecord>, T), String>,
 {
@@ -875,7 +1092,7 @@ where
     let agents_path = anchor.join("managed-agents.json");
     let teams_path = anchor.join("teams.json");
 
-    // Fresh decode — fail closed on any parse error.
+    // Fresh fail-closed decode — any parse error is propagated; no mutation.
     let agents: Vec<ManagedAgentRecord> = if agents_path.exists() {
         let bytes =
             std::fs::read(&agents_path).map_err(|e| format!("read managed-agents.json: {e}"))?;
@@ -889,7 +1106,10 @@ where
 
     let teams: Vec<TeamRecord> = if teams_path.exists() {
         let bytes = std::fs::read(&teams_path).map_err(|e| format!("read teams.json: {e}"))?;
-        decode_team_store(&bytes).map_err(|e| e.message)?
+        decode_team_store(&bytes).map_err(|e| {
+            crate::managed_agents::storage::backup_invalid_store(&teams_path);
+            e.message
+        })?
     } else {
         Vec::new()
     };
@@ -914,24 +1134,26 @@ where
         serde_json::to_vec_pretty(&new_teams).map_err(|e| format!("serialize teams.json: {e}"))?;
     atomic_write_with_fsync(&teams_path, &teams_payload)?;
 
-    // Store mutex guard held for the full critical section; dropped here.
-    drop(store_mutex_guard);
-
-    Ok(result)
+    // Advisory lock drops here; in-process mutex guard returned to caller so
+    // post-write work (retain, tombstone) can run inside the in-process lock.
+    Ok((result, store_mutex_guard))
 }
 
-/// Read-only view of the store under the full lock sequence. Does not
-/// write back JSON files.
+/// Read the store under the full lock sequence without writing back files.
+///
+/// The `store_mutex_guard` is returned so callers can continue holding the
+/// in-process lock after the read.
 #[allow(dead_code)]
-pub fn read_store<F, T>(
+pub fn read_store<'g, F, T>(
     app: &AppHandle,
-    store_mutex_guard: MutexGuard<'_, ()>,
+    store_mutex_guard: MutexGuard<'g, ()>,
     reader: F,
-) -> Result<T, String>
+) -> Result<(T, MutexGuard<'g, ()>), String>
 where
     F: FnOnce(StoreState<'_>) -> Result<T, String>,
 {
     let anchor = store_anchor_dir(app)?;
+    std::fs::create_dir_all(&anchor).map_err(|e| format!("create anchor dir: {e}"))?;
     let _advisory = JournalLockGuard::acquire(&anchor)?;
 
     let agents_path = anchor.join("managed-agents.json");
@@ -950,7 +1172,10 @@ where
 
     let teams: Vec<TeamRecord> = if teams_path.exists() {
         let bytes = std::fs::read(&teams_path).map_err(|e| format!("read teams.json: {e}"))?;
-        decode_team_store(&bytes).map_err(|e| e.message)?
+        decode_team_store(&bytes).map_err(|e| {
+            crate::managed_agents::storage::backup_invalid_store(&teams_path);
+            e.message
+        })?
     } else {
         Vec::new()
     };
@@ -965,8 +1190,7 @@ where
     };
 
     let result = reader(state)?;
-    drop(store_mutex_guard);
-    Ok(result)
+    Ok((result, store_mutex_guard))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -979,9 +1203,50 @@ fn unix_now_secs() -> i64 {
 }
 
 /// Generate a new random UUID v4 operation ID.
-#[allow(dead_code)]
 pub fn new_operation_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Boot recovery: open the journal and log any nonterminal operations.
+///
+/// Nonterminal operations (pending, compensating, uncertain, accepted) may
+/// represent interrupted publishes or partial mutations from a previous crash.
+/// In the current B1 substrate, recovery logs the operations for observability
+/// and marks them as `failed` so they do not accumulate indefinitely.
+///
+/// A fuller recovery (re-drive pending retentions) is B2 scope.  The goal here
+/// is: (a) `store-journal.sqlite` is opened at boot so it actually exists after
+/// a normal app launch, (b) stale nonterminal ops are surfaced/cleared.
+pub fn run_boot_recovery(app: &AppHandle) -> Result<(), String> {
+    let anchor = store_anchor_dir(app)?;
+    std::fs::create_dir_all(&anchor).map_err(|e| format!("boot-recovery create anchor: {e}"))?;
+    let journal = open_journal(&anchor)?;
+
+    let nonterminal = read_nonterminal_operations(&journal)?;
+    if nonterminal.is_empty() {
+        return Ok(());
+    }
+
+    for op in &nonterminal {
+        eprintln!(
+            "buzz-desktop: boot-recovery: nonterminal operation {} kind={} key={} disposition={:?}",
+            op.operation_id, op.kind, op.key_id, op.disposition
+        );
+        // Mark as failed so the next boot does not re-surface it.
+        // A B2 recovery driver would re-try or compensate instead.
+        let _ = advance_disposition(
+            &journal,
+            &op.operation_id,
+            &op.disposition,
+            &Disposition::Failed,
+        );
+    }
+
+    eprintln!(
+        "buzz-desktop: boot-recovery: {} nonterminal operation(s) found and marked failed",
+        nonterminal.len()
+    );
+    Ok(())
 }
 
 #[cfg(test)]

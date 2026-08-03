@@ -274,7 +274,7 @@ pub async fn get_agent_config_surface(
     state: State<'_, AppState>,
 ) -> Result<RuntimeConfigSurface, String> {
     let record = {
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
@@ -286,7 +286,7 @@ pub async fn get_agent_config_surface(
         let (sync_changed, exited_pubkeys) =
             sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
         if sync_changed {
-            save_managed_agents(&app, &records)?;
+            let _store_guard = save_managed_agents(&app, store_guard, &records)?;
         }
         for pubkey in &exited_pubkeys {
             state.clear_agent_session_caches(pubkey);

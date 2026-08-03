@@ -4,7 +4,7 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         current_instance_id, delete_agent_key, load_managed_agents, load_personas, load_teams,
-        save_managed_agents, save_personas, stop_managed_agent_process,
+        save_managed_agents, save_personas_locked, stop_managed_agent_process,
         sync_managed_agent_processes, try_regenerate_nest, validate_persona_activation_change,
         validate_persona_deletion, AgentDefinition, ManagedAgentRecord,
     },
@@ -100,11 +100,15 @@ fn collect_remote_deployed(
 /// this function propagates it before the keyring deletions and tombstones that
 /// appear after the `?` in the call site — nothing is destroyed and the command
 /// is safe to retry.
-fn commit_cascade_agents(
+///
+/// Generic over `G` so callers that need the store guard returned by
+/// `save_managed_agents` (which returns `Result<MutexGuard, String>`) can thread
+/// it back; tests use `G = ()`.
+fn commit_cascade_agents<G>(
     agents: &mut Vec<ManagedAgentRecord>,
     cascade: &std::collections::HashSet<String>,
-    save: impl FnOnce(&[ManagedAgentRecord]) -> Result<(), String>,
-) -> Result<(), String> {
+    save: impl FnOnce(&[ManagedAgentRecord]) -> Result<G, String>,
+) -> Result<G, String> {
     agents.retain(|a| !cascade.contains(&a.pubkey));
     save(agents)
 }
@@ -118,7 +122,7 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
         {
             // Store lock held across all three phases.
             // Lock ordering: store lock (acquired here) → process lock (per-agent in Phase 2).
-            let _store_guard = state
+            let store_guard = state
                 .managed_agents_store_lock
                 .lock()
                 .map_err(|error| error.to_string())?;
@@ -147,23 +151,22 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
             // then released before Phase 2 stops). Every fallible read/lock is
             // here; an error leaves all state intact and the command is retryable.
             let mut agents = load_managed_agents(&app)?;
-            {
+            let sync_exited = {
                 let mut runtimes = state
                     .managed_agent_processes
                     .lock()
                     .map_err(|error| error.to_string())?;
-                let (sync_changed, exited_pubkeys) = sync_managed_agent_processes(
+                let result = sync_managed_agent_processes(
                     &mut agents,
                     &mut runtimes,
                     &current_instance_id(&app),
                 );
-                if sync_changed {
-                    save_managed_agents(&app, &agents)?;
-                }
-                for pk in &exited_pubkeys {
-                    state.clear_agent_session_caches(pk);
-                }
+                result
                 // runtimes drops here (process lock released before Phase 2).
+            };
+            let store_guard = if sync_exited.0 { save_managed_agents(&app, store_guard, &agents)? } else { store_guard };
+            for pk in &sync_exited.1 {
+                state.clear_agent_session_caches(pk);
             }
 
             // Build the cascade set. HashSet for O(1) membership in Phase 3.
@@ -218,18 +221,20 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
             //   persona save fails → cascade agents gone, persona survives; a retry
             //                        finds an empty cascade and proceeds cleanly
             // Keys and tombstones are enqueued only after their records leave disk.
-            if !cascade.is_empty() {
+            let store_guard = if !cascade.is_empty() {
                 commit_cascade_agents(&mut agents, &cascade, |recs| {
-                    save_managed_agents(&app, recs)
-                })?;
-            }
+                    save_managed_agents(&app, store_guard, recs)
+                })?
+            } else {
+                store_guard
+            };
 
             let original_len = personas.len();
             personas.retain(|record| record.id != id);
             if personas.len() == original_len {
                 return Err(format!("persona {id} not found"));
             }
-            save_personas(&app, &personas)?;
+            let _guard = save_personas_locked(&app, store_guard, &personas)?;
 
             // Side effects — strictly after records leave disk.
             for pk in &cascade {
@@ -261,10 +266,10 @@ pub async fn set_persona_active(
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let _store_guard = state
-            .managed_agents_store_lock
-            .lock()
-            .map_err(|error| error.to_string())?;
+
+        // Load and validate before acquiring the store lock — load_personas may
+        // call save_personas internally (built-in merge write-back) which also
+        // acquires the lock; acquiring the lock first would deadlock.
         let mut personas = load_personas(&app)?;
         let persona = personas
             .iter_mut()
@@ -297,7 +302,14 @@ pub async fn set_persona_active(
         persona.updated_at = now_iso();
 
         let updated = persona.clone();
-        save_personas(&app, &personas)?;
+
+        // Acquire the store lock for the write. load_personas above has already
+        // flushed the built-in merge if needed, so no re-entrant lock risk here.
+        let store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let _guard = save_personas_locked(&app, store_guard, &personas)?;
         try_regenerate_nest(&app);
         Ok(updated)
     })

@@ -124,7 +124,7 @@ pub(crate) fn shutdown_managed_agents(app: &tauri::AppHandle) -> Result<(), Stri
         .managed_agent_runtime_transition
         .lock()
         .map_err(|error| error.to_string())?;
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
@@ -257,7 +257,7 @@ pub(crate) fn shutdown_managed_agents(app: &tauri::AppHandle) -> Result<(), Stri
     managed_agents::reap_dead_instance_agents(&managed_agents::current_instance_id(app), &[]);
 
     if changed {
-        save_managed_agents(app, &records)?;
+        let _store_guard = save_managed_agents(app, store_guard, &records)?;
     }
 
     Ok(())

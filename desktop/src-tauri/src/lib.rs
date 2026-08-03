@@ -660,6 +660,21 @@ pub fn run() {
                 });
             }
 
+            // B1 boot recovery: re-drive any nonterminal operations (pending,
+            // compensating, uncertain, accepted) left from a previous crash or
+            // interrupted publication.  Best-effort: a failure is logged and
+            // swallowed so a journal issue never blocks launch.
+            {
+                let recovery_app = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Err(e) =
+                        crate::managed_agents::store_journal::run_boot_recovery(&recovery_app)
+                    {
+                        eprintln!("buzz-desktop: boot-recovery: {e}");
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

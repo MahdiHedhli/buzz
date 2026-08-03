@@ -109,6 +109,13 @@ fn normalize_d_tag(raw: &str) -> String {
     out
 }
 
+/// Public wrapper for [`normalize_d_tag`]. Used by callers that hold raw slug
+/// strings (e.g. `source_team_persona_slug`) and need the same normalization
+/// applied by [`persona_d_tag`] without constructing an `AgentDefinition`.
+pub fn normalize_d_tag_pub(raw: &str) -> String {
+    normalize_d_tag(raw)
+}
+
 /// Compute the NIP-AP monotonic `created_at` for a write (`docs/nips/NIP-AP.md:117`
 /// step 3): `max(now, T + 1)` where `T` is the retained head's `created_at`
 /// (or 0 when no head exists).

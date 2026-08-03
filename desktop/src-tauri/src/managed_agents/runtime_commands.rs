@@ -151,7 +151,7 @@ pub fn list_managed_agent_runtimes(
         .managed_agent_runtime_transition
         .lock()
         .map_err(|e| e.to_string())?;
-    let _store = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| e.to_string())?;
@@ -214,7 +214,7 @@ pub fn list_managed_agent_runtimes(
     // Records are only mutated above when a runtime exited — skip the store
     // rewrite on the common nothing-changed poll.
     if records_changed {
-        save_managed_agents(&app, &records)?;
+        let _guard = save_managed_agents(&app, store_guard, &records)?;
     }
     Ok(statuses)
 }
@@ -251,7 +251,7 @@ fn start_pair(
     if state.shutdown_started.load(Ordering::Acquire) {
         return Err("desktop shutdown has started".into());
     }
-    let _store = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| e.to_string())?;
@@ -304,7 +304,7 @@ fn start_pair(
     runtimes.insert(key.clone(), ManagedAgentPairRuntime::starting(process));
     let status = status_for(&app, record, &key, runtimes.get(&key), None);
     drop(runtimes);
-    save_managed_agents(&app, &records)?;
+    let _store_guard = save_managed_agents(&app, store_guard, &records)?;
     emit_status(&app, &status);
     Ok(status)
 }
@@ -320,7 +320,7 @@ pub fn stop_managed_agent_runtime(
         .managed_agent_runtime_transition
         .lock()
         .map_err(|e| e.to_string())?;
-    let _store = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| e.to_string())?;
@@ -371,7 +371,7 @@ pub fn stop_managed_agent_runtime(
     record.last_stopped_at = Some(record.updated_at.clone());
     let status = status_for(&app, record, &key, None, None);
     drop(runtimes);
-    save_managed_agents(&app, &records)?;
+    let _store_guard = save_managed_agents(&app, store_guard, &records)?;
     emit_status(&app, &status);
     Ok(status)
 }

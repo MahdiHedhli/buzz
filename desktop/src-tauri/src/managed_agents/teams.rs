@@ -161,6 +161,7 @@ pub fn validate_team_deletion(team: &TeamRecord) -> Result<(), String> {
 /// Returns the merged, sorted team list. No file is written — callers that
 /// only need the current logical state (e.g. the snapshot-import pre-read)
 /// use this to avoid a write-on-load side effect.
+#[allow(dead_code)]
 pub(crate) fn load_teams_readonly(path: &std::path::Path) -> Result<Vec<TeamRecord>, String> {
     let now = now_iso();
 
@@ -210,25 +211,13 @@ pub fn load_teams(app: &AppHandle) -> Result<Vec<TeamRecord>, String> {
 }
 
 /// Write `records` to `path` using the fail-closed atomic fsync write.
-/// Called from `load_teams` (already holds the advisory lock) and
-/// `save_teams` (acquires it before calling here).
+/// Called from `load_teams` (already holds the advisory lock).
 fn save_teams_locked(path: &std::path::Path, records: &[TeamRecord]) -> Result<(), String> {
     let mut sorted = records.to_vec();
     sort_teams(&mut sorted);
     let payload = serde_json::to_vec_pretty(&sorted)
         .map_err(|error| format!("failed to serialize teams store: {error}"))?;
     crate::managed_agents::store_journal::atomic_write_with_fsync(path, &payload)
-}
-
-pub fn save_teams(app: &AppHandle, records: &[TeamRecord]) -> Result<(), String> {
-    let path = teams_store_path(app)?;
-
-    // Acquire the interprocess advisory lock before writing.
-    let anchor = crate::managed_agents::store_journal::store_anchor_dir(app)?;
-    std::fs::create_dir_all(&anchor).map_err(|e| format!("failed to create anchor dir: {e}"))?;
-    let _advisory = crate::managed_agents::store_journal::JournalLockGuard::acquire(&anchor)?;
-
-    save_teams_locked(&path, records)
 }
 
 /// Names of managed agents that still reference `team` — either via the
@@ -261,67 +250,86 @@ fn agents_referencing_team<'a>(
 /// tombstoned but the orphaned kind:30175 persona heads stay live on the relay.
 /// For JSON-only teams (no `source_dir`), nothing cascades and the returned
 /// vec is empty.
-pub fn delete_team_with_cascade(app: &AppHandle, team_id: &str) -> Result<Vec<String>, String> {
-    let mut teams = load_teams(app)?;
-    let team = teams
-        .iter()
-        .find(|record| record.id == team_id)
-        .ok_or_else(|| format!("team {team_id} not found"))?;
-
-    validate_team_deletion(team)?;
-
+///
+/// `store_guard` is the caller-held in-process mutex guard.  It is returned so
+/// the caller can continue holding the lock after the delete (e.g. to enqueue
+/// tombstone retention events).  The agents and teams JSON are written
+/// atomically in a single `mutate_store` closure, eliminating the TOCTOU window
+/// between the former `save_personas` + `save_teams` call sequence.
+pub fn delete_team_with_cascade<'g>(
+    app: &AppHandle,
+    team_id: &str,
+    store_guard: std::sync::MutexGuard<'g, ()>,
+) -> Result<(Vec<String>, std::sync::MutexGuard<'g, ()>), String> {
+    // Pre-validate outside the advisory lock (read-only).
     let agents = crate::managed_agents::load_managed_agents(app)?;
-    let referencing = agents_referencing_team(&agents, team);
-    if !referencing.is_empty() {
-        return Err(format!(
-            "Cannot delete team \"{team_id}\": {} agent(s) still reference it ({}). \
-             Delete or reconfigure them first.",
-            referencing.len(),
-            referencing.join(", ")
-        ));
-    }
 
-    let mut cascaded_persona_d_tags = Vec::new();
+    // Perform the atomic delete inside a single mutate_store closure.
+    let team_id = team_id.to_owned();
+    let (cascaded_persona_d_tags, guard) =
+        crate::managed_agents::store_journal::mutate_store(app, store_guard, move |st| {
+            let crate::managed_agents::store_journal::StoreState {
+                agents: mut all_agents,
+                mut teams,
+                ..
+            } = st;
 
-    if team.source_dir.is_some() {
-        // Directory-backed team: cascade personas + backing directory too.
-        // Match on the shared key (directory name) so legacy UUID-id teams
-        // still cascade correctly.
-        let persona_key = team_persona_key(team).to_string();
+            let team = teams
+                .iter()
+                .find(|record| record.id == team_id)
+                .ok_or_else(|| format!("team {team_id} not found"))?;
 
-        // 1. Remove all PersonaRecords sourced from this team
-        let mut personas = super::load_personas(app)?;
-        // Capture the d-tag of each cascaded persona BEFORE removal so the
-        // caller can tombstone its kind:30175 coordinate on the relay.
-        cascaded_persona_d_tags = personas
-            .iter()
-            .filter(|p| p.source_team.as_deref() == Some(persona_key.as_str()))
-            .map(super::persona_events::persona_d_tag)
-            .collect();
-        personas.retain(|p| p.source_team.as_deref() != Some(persona_key.as_str()));
-        super::save_personas(app, &personas)?;
+            validate_team_deletion(team)?;
 
-        // 2. Remove directory
-        if let Some(source_dir) = &team.source_dir {
-            if source_dir.exists() {
-                let is_symlink = fs::symlink_metadata(source_dir)
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false);
-                if is_symlink {
-                    fs::remove_file(source_dir)
-                        .map_err(|e| format!("failed to remove team symlink: {e}"))?;
-                } else {
-                    fs::remove_dir_all(source_dir)
-                        .map_err(|e| format!("failed to remove team directory: {e}"))?;
-                }
+            let referencing = agents_referencing_team(&agents, team);
+            if !referencing.is_empty() {
+                return Err(format!(
+                    "Cannot delete team \"{team_id}\": {} agent(s) still reference it ({}). \
+                     Delete or reconfigure them first.",
+                    referencing.len(),
+                    referencing.join(", ")
+                ));
             }
-        }
-    }
 
-    // 4. Remove TeamRecord
-    teams.retain(|record| record.id != team_id);
-    save_teams(app, &teams)?;
-    Ok(cascaded_persona_d_tags)
+            let mut cascaded_persona_d_tags = Vec::new();
+
+            if team.source_dir.is_some() {
+                // Directory-backed team: cascade persona definitions from the
+                // unified agents array.  Match on the shared persona key.
+                let persona_key = team_persona_key(team).to_string();
+
+                // Capture d-tags before removal so the caller can tombstone them.
+                cascaded_persona_d_tags = all_agents
+                    .iter()
+                    .filter(|r| {
+                        r.pubkey.is_empty()
+                            && r.source_team.as_deref() == Some(persona_key.as_str())
+                    })
+                    .map(|r| {
+                        // d-tag derivation mirrors persona_events::persona_d_tag:
+                        // use source_team_persona_slug if present, else persona_id.
+                        let raw = r
+                            .source_team_persona_slug
+                            .as_deref()
+                            .or(r.persona_id.as_deref())
+                            .unwrap_or("");
+                        crate::managed_agents::persona_events::normalize_d_tag_pub(raw)
+                    })
+                    .collect();
+
+                // Remove the cascaded persona definition records.
+                all_agents.retain(|r| {
+                    !r.pubkey.is_empty() || r.source_team.as_deref() != Some(persona_key.as_str())
+                });
+            }
+
+            // Remove the TeamRecord.
+            teams.retain(|record| record.id != team_id);
+
+            Ok((all_agents, teams, cascaded_persona_d_tags))
+        })?;
+
+    Ok((cascaded_persona_d_tags, guard))
 }
 
 #[cfg(test)]

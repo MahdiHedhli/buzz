@@ -115,14 +115,14 @@ pub(crate) async fn reconcile_agent_profile(
 
             // Persist the backfilled avatar so this migration only runs once.
             if !backfilled.is_empty() {
-                let _store_guard = state
+                let store_guard = state
                     .managed_agents_store_lock
                     .lock()
                     .map_err(|e| e.to_string())?;
                 let mut records = load_managed_agents(app)?;
                 if let Some(record) = records.iter_mut().find(|r| r.pubkey == data.pubkey) {
                     record.avatar_url = Some(backfilled.clone());
-                    save_managed_agents(app, &records)?;
+                    let _store_guard = save_managed_agents(app, store_guard, &records)?;
                 }
             }
 

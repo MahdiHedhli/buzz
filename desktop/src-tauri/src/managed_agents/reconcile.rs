@@ -41,6 +41,16 @@ pub(crate) fn reconcile_agents_to_events(
         return;
     };
 
+    // Acquire the B1 advisory lock so this read-only pass is serialised
+    // against concurrent writers from other processes.  Best-effort: a lock
+    // failure is logged and falls through to the read, which is safe because
+    // the lock is advisory (cooperating-process protection only).
+    let _advisory = crate::managed_agents::store_journal::store_anchor_dir(app)
+        .ok()
+        .and_then(|anchor| {
+            crate::managed_agents::store_journal::JournalLockGuard::acquire(&anchor).ok()
+        });
+
     match reconcile_agents_in_dir_at(&base_dir, keys, db_path) {
         Ok(0) => {}
         Ok(reconciled) => {
@@ -111,7 +121,7 @@ fn reconcile_agents_in_dir_at(
             continue;
         }
 
-        if retain_agent_record(&conn, keys, record)? {
+        if retain_agent_record(&conn, keys, record)?.is_some() {
             reconciled += 1;
         }
     }
@@ -129,11 +139,16 @@ fn reconcile_agents_in_dir_at(
 /// (`retain_managed_agent_pending`, persona-rename propagation). Every
 /// mutation of an agent's published identity must go through it so the
 /// retained record can never silently drift from `managed-agents.json`.
+///
+/// Returns `Some((event_id, raw_json))` when a new event was retained (content
+/// changed or first write), `None` when the agent was a no-op (unchanged
+/// content). Callers that record outbox entries in the B1 journal use the
+/// returned identity to call `insert_outbox_event` before the relay publish.
 pub(crate) fn retain_agent_record(
     conn: &rusqlite::Connection,
     keys: &nostr::Keys,
     record: &ManagedAgentRecord,
-) -> Result<bool, String> {
+) -> Result<Option<(String, String)>, String> {
     let owner_pubkey = keys.public_key().to_hex();
     let existing = get_retained_event(conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
 
@@ -153,8 +168,11 @@ pub(crate) fn retain_agent_record(
 
     let content = event.content.clone();
     if existing.as_ref().is_some_and(|row| row.content == content) {
-        return Ok(false);
+        return Ok(None);
     }
+
+    let event_id = event.id.to_hex();
+    let raw_json = event.as_json();
 
     retain_event(
         conn,
@@ -164,12 +182,12 @@ pub(crate) fn retain_agent_record(
             d_tag: record.pubkey.clone(),
             content,
             created_at: event.created_at.as_secs() as i64,
-            raw_event: event.as_json(),
+            raw_event: raw_json.clone(),
             pending_sync: true,
         },
     )
     .map_err(|e| format!("failed to retain '{}': {e}", record.name))?;
-    Ok(true)
+    Ok(Some((event_id, raw_json)))
 }
 
 #[cfg(test)]

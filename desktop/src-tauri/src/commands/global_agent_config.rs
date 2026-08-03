@@ -262,7 +262,7 @@ async fn restart_local_agent_on_config_change(
         use tauri::Manager;
         let state = app_for_stop.state::<AppState>();
 
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| format!("failed to acquire store lock: {e}"))?;
@@ -279,9 +279,11 @@ async fn restart_local_agent_on_config_change(
             &mut runtimes,
             &current_instance_id(&app_for_stop),
         );
-        if sync_changed {
-            save_managed_agents(&app_for_stop, &records)?;
-        }
+        let store_guard = if sync_changed {
+            save_managed_agents(&app_for_stop, store_guard, &records)?
+        } else {
+            store_guard
+        };
 
         // Re-check eligibility under lock with current record state.
         let record = records
@@ -325,7 +327,7 @@ async fn restart_local_agent_on_config_change(
         // Stop the process.
         let record_mut = find_managed_agent_mut(&mut records, &pubkey_owned)?;
         stop_managed_agent_process(&app_for_stop, record_mut, &mut runtimes)?;
-        save_managed_agents(&app_for_stop, &records)?;
+        let _guard = save_managed_agents(&app_for_stop, store_guard, &records)?;
 
         Ok(runtime_keys)
     })
@@ -378,7 +380,7 @@ async fn restart_local_agent_on_config_change(
 fn persist_last_error(app: &AppHandle, pubkey: &str, error: &str) -> Result<(), String> {
     use tauri::Manager;
     let state = app.state::<AppState>();
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| format!("failed to acquire store lock: {e}"))?;
@@ -386,7 +388,7 @@ fn persist_last_error(app: &AppHandle, pubkey: &str, error: &str) -> Result<(), 
     let record = find_managed_agent_mut(&mut records, pubkey)?;
     record.last_error = Some(error.to_string());
     record.updated_at = crate::util::now_iso();
-    save_managed_agents(app, &records)
+    save_managed_agents(app, store_guard, &records).map(|_| ())
 }
 
 /// Pure predicate: should an agent be restarted given resolved readiness and

@@ -26,7 +26,7 @@ pub async fn set_managed_agent_start_on_app_launch(
 ) -> Result<ManagedAgentSummary, String> {
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
@@ -38,9 +38,11 @@ pub async fn set_managed_agent_start_on_app_launch(
 
         let (sync_changed, exited_pubkeys) =
             sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
-        if sync_changed {
-            save_managed_agents(&app, &records)?;
-        }
+        let store_guard = if sync_changed {
+            save_managed_agents(&app, store_guard, &records)?
+        } else {
+            store_guard
+        };
         for pubkey in &exited_pubkeys {
             state.clear_agent_session_caches(pubkey);
         }
@@ -51,7 +53,7 @@ pub async fn set_managed_agent_start_on_app_launch(
             record.updated_at = now_iso();
         }
 
-        save_managed_agents(&app, &records)?;
+        let _store_guard = save_managed_agents(&app, store_guard, &records)?;
         let record = records
             .iter()
             .find(|record| record.pubkey == pubkey)
@@ -77,7 +79,7 @@ pub async fn set_managed_agent_auto_restart(
 ) -> Result<ManagedAgentSummary, String> {
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
@@ -89,9 +91,11 @@ pub async fn set_managed_agent_auto_restart(
 
         let (sync_changed, exited_pubkeys) =
             sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
-        if sync_changed {
-            save_managed_agents(&app, &records)?;
-        }
+        let store_guard = if sync_changed {
+            save_managed_agents(&app, store_guard, &records)?
+        } else {
+            store_guard
+        };
         for pubkey in &exited_pubkeys {
             state.clear_agent_session_caches(pubkey);
         }
@@ -102,7 +106,7 @@ pub async fn set_managed_agent_auto_restart(
             record.updated_at = now_iso();
         }
 
-        save_managed_agents(&app, &records)?;
+        let _store_guard = save_managed_agents(&app, store_guard, &records)?;
         let record = records
             .iter()
             .find(|record| record.pubkey == pubkey)

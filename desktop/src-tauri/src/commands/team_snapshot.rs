@@ -17,8 +17,8 @@ use crate::{
     },
     managed_agents::{
         agent_snapshot::{build_snapshot, AgentSnapshot, AgentSnapshotMemoryEntry, MemoryLevel},
-        load_managed_agents, load_personas, load_teams, load_teams_readonly, save_managed_agents,
-        save_personas, save_teams, AgentDefinition, ManagedAgentRecord, TeamRecord,
+        load_managed_agents, load_personas, load_teams, AgentDefinition, ManagedAgentRecord,
+        TeamRecord,
     },
     relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -626,7 +626,7 @@ pub async fn confirm_team_snapshot_import(
 
     // ── Phase 3: store (sync, inside lock) ──────────────────────────────────
     let team = {
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
@@ -642,112 +642,82 @@ pub async fn confirm_team_snapshot_import(
             }
         }
 
-        // Snapshot both store files for rollback on partial write failure.
-        // Distinguish "file exists with content" from "file absent" so rollback
-        // can delete a file created by the import rather than leaving orphaned
-        // records.
-        //
-        // Use the store-family anchor so the snapshot/restore targets the same
-        // file that load/save_managed_agents operate on (canonical dev path for
-        // shared worktrees, bundle path for standalone).
-        let agents_store_path = {
+        // Write all definitions, instances, and the team record in ONE
+        // mutate_store transaction so the advisory lock spans the full
+        // decode → mutate → write sequence.  If any step fails before the
+        // file writes, nothing is written — no byte snapshot/restore needed.
+        let new_defs: Vec<ManagedAgentRecord> = minted
+            .iter()
+            .map(|m| m.definition.clone().into_agent_record())
+            .collect();
+        let new_instances: Vec<ManagedAgentRecord> =
+            minted.iter().map(|m| m.record.clone()).collect();
+        let new_team = imported_team.clone();
+
+        // Record the operation in the journal before the file write.
+        let op_id = crate::managed_agents::store_journal::new_operation_id();
+        let op_id_for_closure = op_id.clone();
+        let team_id_for_closure = imported_team.id.clone();
+
+        let ((), _store_guard) =
+            crate::managed_agents::store_journal::mutate_store(&app, store_guard, move |st| {
+                // Journal: record team_import operation (before any file write).
+                crate::managed_agents::store_journal::insert_operation(
+                    st.journal,
+                    &op_id_for_closure,
+                    "team_import",
+                    &team_id_for_closure,
+                    crate::managed_agents::store_journal::Generation::zero(),
+                )?;
+
+                // Build new agents array: existing + new definitions + new instances.
+                let mut all_agents = st.agents;
+
+                // Sort new definitions and append.
+                let mut sorted_defs = new_defs;
+                sorted_defs.sort_by(|a, b| {
+                    a.slug
+                        .as_deref()
+                        .unwrap_or("")
+                        .cmp(b.slug.as_deref().unwrap_or(""))
+                });
+                all_agents.extend(sorted_defs);
+
+                // Persist keys for new instances; append after sorting.
+                let mut sorted_instances = new_instances;
+                crate::managed_agents::storage::persist_agent_keys_pub(&mut sorted_instances);
+                sorted_instances.sort_by(|a, b| {
+                    a.name
+                        .to_lowercase()
+                        .cmp(&b.name.to_lowercase())
+                        .then_with(|| a.pubkey.cmp(&b.pubkey))
+                });
+                all_agents.extend(sorted_instances);
+
+                // Append the new team record.
+                let mut all_teams = st.teams;
+                all_teams.push(new_team);
+                all_teams.sort_by(|a, b| a.name.cmp(&b.name));
+
+                Ok((all_agents, all_teams, ()))
+            })?;
+
+        // Advance operation to committed after the file write.
+        {
             let anchor = crate::managed_agents::store_journal::store_anchor_dir(&app)?;
-            anchor.join("managed-agents.json")
-        };
-        let agents_store_snapshot = match std::fs::read(&agents_store_path) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("failed to snapshot agent store: {e}")),
-        };
-        let teams_store_path = crate::managed_agents::teams_store_path(&app)?;
-        let teams_store_snapshot = match std::fs::read(&teams_store_path) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("failed to snapshot teams store: {e}")),
-        };
-
-        // Pre-read teams via the read-only loader BEFORE any agent commits.
-        // This avoids load_teams()'s write-on-load side effect (teams.rs:165-166
-        // saves whenever the file is absent or built-ins changed). A failure here
-        // aborts cleanly — zero writes have occurred.
-        let mut teams = load_teams_readonly(&teams_store_path)?;
-
-        // Collect minted pubkeys for keyring cleanup on rollback.
-        let minted_pubkeys: Vec<&str> = minted.iter().map(|m| m.pubkey.as_str()).collect();
-
-        // Restore the agent store to pre-import state and clean minted keyring
-        // entries. Returns the original error, extended with rollback details.
-        let rollback_agents = |original_err: String| -> String {
-            let mut errors = vec![original_err];
-            // Clean minted keyring entries.
-            for pubkey in &minted_pubkeys {
-                if let Err(e) = crate::managed_agents::storage::try_delete_agent_key(pubkey) {
-                    errors.push(format!("keyring cleanup {pubkey}: {e}"));
-                }
+            if let Ok(journal) = crate::managed_agents::store_journal::open_journal(&anchor) {
+                let _ = crate::managed_agents::store_journal::advance_disposition(
+                    &journal,
+                    &op_id,
+                    &crate::managed_agents::store_journal::Disposition::Pending,
+                    &crate::managed_agents::store_journal::Disposition::Committed,
+                );
             }
-            // Restore agent store file.
-            let restore = match &agents_store_snapshot {
-                Some(bytes) => {
-                    crate::managed_agents::store_journal::atomic_write_restricted_with_fsync(
-                        &agents_store_path,
-                        bytes,
-                    )
-                }
-                None => match std::fs::remove_file(&agents_store_path) {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    other => other.map_err(|e| e.to_string()),
-                },
-            };
-            if let Err(e) = restore {
-                errors.push(format!("agent store restore: {e}"));
-            }
-            if errors.len() == 1 {
-                errors.into_iter().next().unwrap()
-            } else {
-                errors.join("; ")
-            }
-        };
-
-        // Write all definitions.
-        let mut personas = load_personas(&app)?;
-        for m in &minted {
-            personas.push(m.definition.clone());
-        }
-        if let Err(e) = save_personas(&app, &personas) {
-            return Err(rollback_agents(e));
         }
 
-        // Write all managed-agent records.
-        let mut records = existing_records;
-        for m in &minted {
-            records.push(m.record.clone());
-        }
-        if let Err(e) = save_managed_agents(&app, &records) {
-            return Err(rollback_agents(e));
-        }
-
-        // Write the team record. `teams` was pre-loaded via the read-only
-        // loader before any agent commits, so a read/parse failure already
-        // aborted before any phase-3 write. save_teams sorts and persists.
-        teams.push(imported_team.clone());
-        if let Err(e) = save_teams(&app, &teams) {
-            let err = rollback_agents(e);
-            // Also restore teams store.
-            let teams_restore = match &teams_store_snapshot {
-                Some(bytes) => crate::managed_agents::store_journal::atomic_write_with_fsync(
-                    &teams_store_path,
-                    bytes,
-                ),
-                None => match std::fs::remove_file(&teams_store_path) {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    other => other.map_err(|e| e.to_string()),
-                },
-            };
-            return Err(match teams_restore {
-                Ok(()) => err,
-                Err(teams_err) => format!("{err}; teams store restore: {teams_err}"),
-            });
-        }
+        // Keyring cleanup is already handled by persist_agent_keys_pub inside
+        // the closure above.  On failure the closure returns Err and mutate_store
+        // propagates it before writing any file — no rollback required.
 
         // All writes committed — safe to update in-memory state.
         for m in &minted {

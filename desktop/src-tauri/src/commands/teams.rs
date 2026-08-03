@@ -5,7 +5,8 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         delete_team_with_cascade, ensure_persona_ids_are_active, load_personas, load_teams,
-        save_teams, try_regenerate_nest, CreateTeamRequest, TeamRecord, UpdateTeamRequest,
+        storage::mutate_team_store, try_regenerate_nest, CreateTeamRequest, TeamRecord,
+        UpdateTeamRequest,
     },
     util::now_iso,
 };
@@ -57,6 +58,31 @@ pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &Team
             .custom_created_at(monotonic_created_at(prior))
             .sign_with_keys(&scope.owner_keys)
             .map_err(|e| format!("failed to sign team event: {e}"))?;
+        let event_id = event.id.to_hex();
+        let raw_json = event.as_json();
+
+        // B1 journal outbox: record the immutable event identity before
+        // the retention DB entry is flushed to the relay.
+        let anchor = crate::managed_agents::store_journal::store_anchor_dir(app)?;
+        std::fs::create_dir_all(&anchor)
+            .map_err(|e| format!("create anchor dir for team outbox: {e}"))?;
+        if let Ok(journal) = crate::managed_agents::store_journal::open_journal(&anchor) {
+            let pub_op_id = crate::managed_agents::store_journal::new_operation_id();
+            let _ = crate::managed_agents::store_journal::insert_operation(
+                &journal,
+                &pub_op_id,
+                "publish",
+                &team.id,
+                crate::managed_agents::store_journal::Generation::zero(),
+            );
+            let _ = crate::managed_agents::store_journal::insert_outbox_event(
+                &journal,
+                &event_id,
+                &pub_op_id,
+                raw_json.as_bytes(),
+            );
+        }
+
         retain_event(
             &conn,
             &RetainedEvent {
@@ -65,7 +91,7 @@ pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &Team
                 d_tag: team.id.clone(),
                 content: event.content.to_string(),
                 created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
+                raw_event: raw_json,
                 pending_sync: true,
             },
         )
@@ -150,13 +176,12 @@ pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<Tea
         let instructions = trim_optional(input.instructions);
         let now = now_iso();
 
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
         let personas = load_personas(&app)?;
         ensure_persona_ids_are_active(&personas, &input.persona_ids)?;
-        let mut teams = load_teams(&app)?;
         let team = TeamRecord {
             id: Uuid::new_v4().to_string(),
             name,
@@ -171,8 +196,11 @@ pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<Tea
             created_at: now.clone(),
             updated_at: now,
         };
-        teams.push(team.clone());
-        save_teams(&app, &teams)?;
+        let team_for_closure = team.clone();
+        let ((), _guard) = mutate_team_store(&app, store_guard, move |mut teams, _journal| {
+            teams.push(team_for_closure);
+            Ok((teams, ()))
+        })?;
         // Created teams are always non-builtin; publish to the relay.
         retain_team_pending(&app, &state, &team);
         Ok(team)
@@ -190,26 +218,28 @@ pub async fn update_team(input: UpdateTeamRequest, app: AppHandle) -> Result<Tea
         let description = trim_optional(input.description);
         let instructions = trim_optional(input.instructions);
 
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
         let personas = load_personas(&app)?;
         ensure_persona_ids_are_active(&personas, &input.persona_ids)?;
-        let mut teams = load_teams(&app)?;
-        let team = teams
-            .iter_mut()
-            .find(|record| record.id == input.id)
-            .ok_or_else(|| format!("team {} not found", input.id))?;
-
-        team.name = name;
-        team.description = description;
-        team.instructions = instructions;
-        team.persona_ids = input.persona_ids;
-        team.updated_at = now_iso();
-
-        let updated = team.clone();
-        save_teams(&app, &teams)?;
+        let target_id = input.id.clone();
+        let now2 = now_iso();
+        let (updated, _guard) =
+            mutate_team_store(&app, store_guard, move |mut teams, _journal| {
+                let team = teams
+                    .iter_mut()
+                    .find(|record| record.id == target_id)
+                    .ok_or_else(|| format!("team {target_id} not found"))?;
+                team.name = name;
+                team.description = description;
+                team.instructions = instructions;
+                team.persona_ids = input.persona_ids;
+                team.updated_at = now2;
+                let updated = team.clone();
+                Ok((teams, updated))
+            })?;
         // Built-in teams are not owner-authored — never publish them.
         if !updated.is_builtin {
             retain_team_pending(&app, &state, &updated);
@@ -225,11 +255,11 @@ pub async fn delete_team(id: String, app: AppHandle) -> Result<(), String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        let cascaded_persona_d_tags = delete_team_with_cascade(&app, &id)?;
+        let (cascaded_persona_d_tags, _guard) = delete_team_with_cascade(&app, &id, store_guard)?;
         // delete_team_with_cascade rejects built-in teams via validate_team_deletion,
         // so reaching here means this team was owner-published — tombstone it. The
         // d_tag is the team id, captured before the record left the store.
