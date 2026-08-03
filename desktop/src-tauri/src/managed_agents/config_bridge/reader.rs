@@ -504,14 +504,64 @@ fn build_thinking_field(
         })
         .unwrap_or([None, None, None, None]);
 
-    let tiers_list: &[(Option<&str>, ConfigOrigin)] = &[
+    // Effort same-value collapse (B heuristic): when ACP would be the winner
+    // and its value exactly equals what inheritance already resolves to, fall
+    // through to non-ACP resolution so the panel shows the true baseline origin
+    // (e.g. "Global default") rather than "Runtime override (this session
+    // only)".  The live session is almost certainly echoing what spawn injected;
+    // labelling it an override misleads the user in the common case.
+    //
+    // Effort-only: model has an explicit `model_overridden` signal; effort
+    // has no equivalent, so we apply the heuristic unconditionally for effort
+    // alone (per Thufir's plan-review boundary).
+    let without_acp: &[(Option<&str>, ConfigOrigin)] = &[
         (rec_env, ConfigOrigin::BuzzExplicit),
-        (acp_effort.as_deref(), ConfigOrigin::AcpConfigOption),
         (pers_env, ConfigOrigin::PersonaDefault),
         (glob_env, ConfigOrigin::GlobalDefault),
         (def_env, ConfigOrigin::HarnessDefault),
         (file_effort.as_deref(), ConfigOrigin::ConfigFile),
     ];
+
+    let tiers_list: &[(Option<&str>, ConfigOrigin)];
+    // Borrow-checker-friendly: materialise an owned copy only when we need to
+    // inject ACP; otherwise use `without_acp` directly.
+    let with_acp_storage;
+    if rec_env.is_none() {
+        if let Some(acp) = acp_effort.as_deref() {
+            let baseline_value = without_acp
+                .iter()
+                .find(|(v, _)| v.is_some())
+                .and_then(|(v, _)| *v);
+            if baseline_value == Some(acp) {
+                // Equal-value: fall through to non-ACP resolution.
+                tiers_list = without_acp;
+            } else {
+                // Genuine divergence: ACP wins between rec_env and pers_env.
+                with_acp_storage = [
+                    (rec_env, ConfigOrigin::BuzzExplicit),
+                    (acp_effort.as_deref(), ConfigOrigin::AcpConfigOption),
+                    (pers_env, ConfigOrigin::PersonaDefault),
+                    (glob_env, ConfigOrigin::GlobalDefault),
+                    (def_env, ConfigOrigin::HarnessDefault),
+                    (file_effort.as_deref(), ConfigOrigin::ConfigFile),
+                ];
+                tiers_list = &with_acp_storage;
+            }
+        } else {
+            tiers_list = without_acp;
+        }
+    } else {
+        // rec_env is Some: record-level env always wins over ACP regardless.
+        with_acp_storage = [
+            (rec_env, ConfigOrigin::BuzzExplicit),
+            (acp_effort.as_deref(), ConfigOrigin::AcpConfigOption),
+            (pers_env, ConfigOrigin::PersonaDefault),
+            (glob_env, ConfigOrigin::GlobalDefault),
+            (def_env, ConfigOrigin::HarnessDefault),
+            (file_effort.as_deref(), ConfigOrigin::ConfigFile),
+        ];
+        tiers_list = &with_acp_storage;
+    }
     let (value, origin, overridden_value, overridden_origin) = resolve_with_override(tiers_list)?;
 
     let write_via = if !is_pre_spawn && has_config_option(session_cache, "effort") {

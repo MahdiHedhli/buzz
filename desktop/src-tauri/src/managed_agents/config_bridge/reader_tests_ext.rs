@@ -256,3 +256,120 @@ fn reserved_key_absent_from_definition_env_falls_through() {
     assert_eq!(model.value.as_deref(), Some("persona-struct-model"));
     assert_eq!(model.origin, ConfigOrigin::PersonaDefault);
 }
+
+// ── Effort same-value collapse (Phase 1 / heuristic B) ───────────────────────
+//
+// When live ACP effort echoes the inherited value, the panel must show the
+// true inherited origin — not "Runtime override (this session only)".
+// Tests pin all three cases from the plan's success criteria.
+
+/// Case 1: live ACP effort == inherited global effort → falls through to
+/// GlobalDefault, no secondary row.  Wrapped in with_goose_path_root to
+/// prevent the Goose config file from injecting a GOOSE_THINKING_EFFORT value
+/// that could flip the equal-value test to a genuine divergence.
+#[test]
+fn acp_effort_equal_to_global_effort_collapses_to_global_default() {
+    let record = test_record();
+    let runtime = buzz_agent_rt();
+    // Live session echoing inherited effort=high.
+    let cache = SessionConfigCache {
+        config_options: vec![AcpConfigOptionEntry {
+            config_id: "effort".to_string(),
+            category: Some("effort".to_string()),
+            display_name: Some("Effort".to_string()),
+            current_value: Some("high".to_string()),
+            options: vec![],
+        }],
+        available_modes: vec![],
+        available_models: vec![],
+        current_model: None,
+        model_overridden: false,
+        goose_native_config: None,
+        captured_at: "".to_string(),
+    };
+    let tiers = global_env_tiers("BUZZ_AGENT_THINKING_EFFORT", "high");
+
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &tiers);
+
+    let effort = surface
+        .normalized
+        .thinking_effort
+        .expect("effort must surface");
+    // Equal-value collapse: baseline origin shown, not AcpConfigOption.
+    assert_eq!(effort.value.as_deref(), Some("high"));
+    assert_eq!(effort.origin, ConfigOrigin::GlobalDefault);
+    // No secondary row — nothing was genuinely overridden.
+    assert!(effort.overridden_value.is_none());
+    assert!(effort.overridden_origin.is_none());
+}
+
+/// Case 2: live ACP effort != inherited global effort → genuine divergence,
+/// AcpConfigOption wins with global as overridden baseline (same as AC-5).
+#[test]
+fn acp_effort_differs_from_global_effort_shows_override_with_baseline() {
+    let record = test_record();
+    let runtime = buzz_agent_rt();
+    let cache = SessionConfigCache {
+        config_options: vec![AcpConfigOptionEntry {
+            config_id: "effort".to_string(),
+            category: Some("effort".to_string()),
+            display_name: Some("Effort".to_string()),
+            current_value: Some("high".to_string()),
+            options: vec![],
+        }],
+        available_modes: vec![],
+        available_models: vec![],
+        current_model: None,
+        model_overridden: false,
+        goose_native_config: None,
+        captured_at: "".to_string(),
+    };
+    let tiers = global_env_tiers("BUZZ_AGENT_THINKING_EFFORT", "medium");
+
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &tiers);
+
+    let effort = surface
+        .normalized
+        .thinking_effort
+        .expect("effort must surface");
+    // Genuine divergence: ACP wins.
+    assert_eq!(effort.value.as_deref(), Some("high"));
+    assert_eq!(effort.origin, ConfigOrigin::AcpConfigOption);
+    // Global medium is the overridden secondary.
+    assert_eq!(effort.overridden_value.as_deref(), Some("medium"));
+    assert_eq!(effort.overridden_origin, Some(ConfigOrigin::GlobalDefault));
+}
+
+/// Case 3: live ACP effort with NO inherited tier → stays AcpConfigOption
+/// (nothing to collapse to).
+#[test]
+fn acp_effort_with_no_inherited_tier_stays_acp_config_option() {
+    let record = test_record();
+    let runtime = buzz_agent_rt();
+    let cache = SessionConfigCache {
+        config_options: vec![AcpConfigOptionEntry {
+            config_id: "effort".to_string(),
+            category: Some("effort".to_string()),
+            display_name: Some("Effort".to_string()),
+            current_value: Some("high".to_string()),
+            options: vec![],
+        }],
+        available_modes: vec![],
+        available_models: vec![],
+        current_model: None,
+        model_overridden: false,
+        goose_native_config: None,
+        captured_at: "".to_string(),
+    };
+
+    // No inherited tiers — ACP is the only source.
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &no_tiers());
+
+    let effort = surface
+        .normalized
+        .thinking_effort
+        .expect("effort must surface from ACP when no inherited tier");
+    assert_eq!(effort.value.as_deref(), Some("high"));
+    assert_eq!(effort.origin, ConfigOrigin::AcpConfigOption);
+    assert!(effort.overridden_value.is_none());
+}
