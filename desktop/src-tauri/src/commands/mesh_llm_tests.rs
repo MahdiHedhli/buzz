@@ -574,3 +574,140 @@ fn ensure_serve_runtime_serves_other_model() {
         .join()
         .expect("mesh acceptance thread panicked");
 }
+
+/// Manual acceptance test for relay mode: starts a real embedded mesh node
+/// relaying to an external OpenAI-compatible server (no local model), and
+/// confirms the relayed server's models are advertised through the local
+/// ingress and that a real chat completion round-trips.
+///
+/// Requires `buzz-mesh-relay-plugin` to be built and resolvable via
+/// `resolve_command` (built once with `cargo build -p buzz-mesh-relay-plugin`
+/// and its containing target dir on PATH), and:
+///   BUZZ_MESH_RELAY_TEST_URL=https://<host>:<port>/v1
+///   BUZZ_MESH_RELAY_TEST_API_KEY=<key>   (optional, for an authenticated target)
+///
+/// ```text
+/// cargo test --manifest-path desktop/src-tauri/Cargo.toml --features mesh-llm \
+///   ensure_serve_runtime_relays_to_external_server -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "relays to a real external OpenAI-compatible server; run manually with --ignored"]
+fn ensure_serve_runtime_relays_to_external_server() {
+    std::thread::Builder::new()
+        .name("mesh-relay-acceptance".to_string())
+        .stack_size(mesh_llm::MESH_WORKER_STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(mesh_llm::MESH_WORKER_STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("build mesh relay acceptance runtime");
+            runtime.block_on(async {
+                let upstream_url = std::env::var("BUZZ_MESH_RELAY_TEST_URL")
+                    .expect("BUZZ_MESH_RELAY_TEST_URL is required for this test");
+                let api_key = std::env::var("BUZZ_MESH_RELAY_TEST_API_KEY").ok();
+
+                let app_data_dir = std::env::temp_dir()
+                    .join(format!("buzz-mesh-relay-acceptance-{}", std::process::id()));
+                std::fs::create_dir_all(&app_data_dir).expect("create temp app data dir");
+
+                let config_path = mesh_llm::prepare_relay_plugin_config(
+                    &app_data_dir,
+                    &upstream_url,
+                    api_key.as_deref(),
+                )
+                .expect("prepare relay plugin config — is buzz-mesh-relay-plugin on PATH?");
+
+                let serve = mesh_llm::DesktopMeshRuntime::start(mesh_llm::StartMeshNodeRequest {
+                    mode: mesh_llm::MeshNodeMode::Serve,
+                    model_id: None,
+                    max_vram_gb: None,
+                    join_token: None,
+                    mesh_name: None,
+                    relay_url: None,
+                    trusted_owner_ids: None,
+                    relay_upstream_url: Some(upstream_url),
+                    relay_api_key: None,
+                    relay_plugin_config_path: Some(config_path),
+                })
+                .await
+                .expect("relay serve runtime should start");
+
+                let serve_status = serve.status().await.expect("serve status");
+                let serve_base = serve_status
+                    .api_base_url
+                    .clone()
+                    .expect("serve runtime must expose its local API base");
+                assert_eq!(serve_status.mode, Some(mesh_llm::MeshNodeMode::Serve));
+
+                // The plugin's health probe runs on a ~15s interval; give it
+                // room to discover the relayed server's models and advertise
+                // them through the local ingress.
+                let http = reqwest::Client::new();
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                let model_id = loop {
+                    let body = http
+                        .get(format!("{serve_base}/models"))
+                        .send()
+                        .await
+                        .expect("query relay-advertised catalog")
+                        .error_for_status()
+                        .expect("relay-advertised catalog status")
+                        .json::<serde_json::Value>()
+                        .await
+                        .expect("parse relay-advertised catalog");
+                    let first_model = body["data"]
+                        .as_array()
+                        .and_then(|models| {
+                            models
+                                .iter()
+                                .find(|model| model["id"].as_str() != Some("mesh"))
+                        })
+                        .and_then(|model| model["id"].as_str())
+                        .map(str::to_string);
+                    if let Some(model_id) = first_model {
+                        break model_id;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "no relayed model appeared within 60s: {body}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                };
+                println!("relay-advertised model: {model_id}");
+
+                let completion = http
+                    .post(format!("{serve_base}/chat/completions"))
+                    .json(&serde_json::json!({
+                        "model": model_id,
+                        "messages": [{"role": "user", "content": "Reply with exactly: RELAY_OK"}],
+                        "max_tokens": 8,
+                        "temperature": 0.0,
+                        "stream": false
+                    }))
+                    .send()
+                    .await
+                    .expect("send chat completion")
+                    .error_for_status()
+                    .expect("chat completion status")
+                    .json::<serde_json::Value>()
+                    .await
+                    .expect("parse chat completion");
+                let content = completion["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or_default();
+                assert!(
+                    !content.trim().is_empty(),
+                    "completion content must not be empty: {completion}"
+                );
+                println!("relay completion content: {content:?}");
+
+                let _ = serve.stop().await;
+                let _ = std::fs::remove_dir_all(&app_data_dir);
+            });
+        })
+        .expect("spawn mesh relay acceptance thread")
+        .join()
+        .expect("mesh relay acceptance thread panicked");
+}
