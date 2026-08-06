@@ -5,8 +5,10 @@ SIDECARS=(buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz)
 HOST=$(rustc -vV | sed -n 's|host: ||p')
 TARGET=${1:-$HOST}
 if [[ "$TARGET" != *windows* ]]; then
-    SIDECARS+=(buzz-backend-kubernetes)
-    BUILD_HINT="cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli"
+    # buzz-mesh-relay-plugin is only bundled where the mesh-llm feature is
+    # built (see desktop/src-tauri/tauri.windows.conf.json, which omits it).
+    SIDECARS+=(buzz-backend-kubernetes buzz-mesh-relay-plugin)
+    BUILD_HINT="cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-mesh-relay-plugin -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli"
 else
     BUILD_HINT="cargo build --release -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli"
 fi

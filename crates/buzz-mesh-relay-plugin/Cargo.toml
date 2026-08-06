@@ -1,0 +1,31 @@
+[package]
+name = "buzz-mesh-relay-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mesh-LLM plugin that relays serving traffic to an external, bearer-authenticated OpenAI-compatible server"
+
+[lib]
+name = "buzz_mesh_relay_plugin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzz-mesh-relay-plugin"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { workspace = true }
+# Vendored copy of the Buzz-forked openai-endpoint plugin (see
+# https://github.com/MahdiHedhli/openai-endpoint, branch buzz-auth-relay,
+# aimed at an upstream PR) so it builds through Buzz's own release pipeline
+# (scripts/bundle-sidecars.sh only builds first-party workspace crates) as a
+# Tauri sidecar, the same way buzz-acp/buzz-agent do.
+mesh-llm-plugin = { git = "https://github.com/MahdiHedhli/mesh-llm.git", branch = "buzz-v0.74.0-relay" }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+serde_json = "1"

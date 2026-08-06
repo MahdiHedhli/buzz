@@ -1079,6 +1079,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-mesh-relay-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "mesh-llm-plugin 0.74.0 (git+https://github.com/MahdiHedhli/mesh-llm.git?branch=buzz-v0.74.0-relay)",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "buzz-pair-relay"
 version = "0.1.0"
 dependencies = [
@@ -4941,7 +4953,7 @@ dependencies = [
  "mesh-llm-identity",
  "mesh-llm-native-runtime",
  "mesh-llm-node",
- "mesh-llm-plugin",
+ "mesh-llm-plugin 0.74.0 (git+https://github.com/Mesh-LLM/mesh-llm.git?tag=v0.74.0)",
  "mesh-llm-plugin-manager",
  "mesh-llm-protocol",
  "mesh-llm-routing",
@@ -5046,6 +5058,23 @@ dependencies = [
 name = "mesh-llm-plugin"
 version = "0.74.0"
 source = "git+https://github.com/Mesh-LLM/mesh-llm.git?tag=v0.74.0#e60b2fe43aa05271569fbeff2a457133aef456a1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "prost 0.14.3",
+ "prost-build 0.14.3",
+ "protoc-bin-vendored",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mesh-llm-plugin"
+version = "0.74.0"
+source = "git+https://github.com/MahdiHedhli/mesh-llm.git?branch=buzz-v0.74.0-relay#2daf691ebf43f42ac777002a0af18fb51d4e6161"
 dependencies = [
  "anyhow",
  "async-trait",
