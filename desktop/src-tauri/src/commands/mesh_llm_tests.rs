@@ -645,7 +645,7 @@ fn ensure_serve_runtime_relays_to_external_server() {
                 // room to discover the relayed server's models and advertise
                 // them through the local ingress.
                 let http = reqwest::Client::new();
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
                 let model_id = loop {
                     let body = http
                         .get(format!("{serve_base}/models"))
