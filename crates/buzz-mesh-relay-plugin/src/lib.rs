@@ -224,12 +224,31 @@ fn build_plugin(
     }
 }
 
+// TEMPORARY diagnostic — remove once the post-handshake timeout is root-caused.
+fn debug_log(line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/buzz-mesh-relay-plugin-debug.log")
+    {
+        let _ = writeln!(f, "[{:?}] {line}", std::time::SystemTime::now());
+    }
+}
+
 async fn run_plugin(name: String) -> Result<()> {
+    debug_log("run_plugin: start");
     let upstream_base_url = upstream_base_url();
+    debug_log(&format!("run_plugin: upstream_base_url={upstream_base_url}"));
     let api_key = api_key_from_args()?;
+    debug_log(&format!("run_plugin: api_key_present={}", api_key.is_some()));
     let proxy_addr = spawn_auth_proxy(upstream_base_url.clone(), api_key).await?;
+    debug_log(&format!("run_plugin: proxy listening on {proxy_addr}"));
     let advertised_base_url = format!("http://{proxy_addr}{ADVERTISED_PATH_PREFIX}");
-    PluginRuntime::run(build_plugin(name, advertised_base_url, upstream_base_url)).await
+    debug_log("run_plugin: entering PluginRuntime::run");
+    let result = PluginRuntime::run(build_plugin(name, advertised_base_url, upstream_base_url)).await;
+    debug_log(&format!("run_plugin: PluginRuntime::run returned {result:?}"));
+    result
 }
 
 pub fn run_main() -> i32 {
