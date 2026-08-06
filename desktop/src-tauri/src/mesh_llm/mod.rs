@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 mod coordinator;
 pub(crate) use coordinator::{publish_current_status_once, publish_stopped_status_once_at};
@@ -214,6 +215,24 @@ pub struct StartMeshNodeRequest {
     /// included by the caller).
     #[serde(default)]
     pub trusted_owner_ids: Option<Vec<String>>,
+    /// An already-running external OpenAI-compatible server (LM Studio, vLLM,
+    /// etc.) to relay this node's serving traffic to, instead of downloading
+    /// and running a local model. When set, `model_id` is not required and no
+    /// download occurs — the relay plugin's upstream models are auto-discovered
+    /// by mesh-llm's own health probe and advertised to the pool.
+    #[serde(default)]
+    pub relay_upstream_url: Option<String>,
+    /// Bearer key to authenticate to `relay_upstream_url`. Carried over this
+    /// IPC call only — never persisted inline; callers store it via secret
+    /// storage and pass it back in on restore.
+    #[serde(default)]
+    pub relay_api_key: Option<String>,
+    /// Resolved plugin config path for relay mode, computed by the caller
+    /// (which holds the `AppHandle` needed for the app data dir and secret
+    /// storage) via [`prepare_relay_plugin_config`]. Not accepted from the
+    /// frontend — computed on the backend from `relay_upstream_url`/`relay_api_key`.
+    #[serde(default, skip_deserializing)]
+    pub relay_plugin_config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -310,6 +329,122 @@ async fn initialize_mesh_native_runtime() -> anyhow::Result<()> {
 /// app starts, so every command future gets the same headroom.
 pub const MESH_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
+/// Filename for the relay plugin's bundled sidecar binary, resolved via
+/// [`crate::managed_agents::resolve_command`] the same way `buzz-acp` and
+/// other Tauri sidecars are resolved (bundled `externalBin` next to the app,
+/// falling back to PATH in dev).
+const RELAY_PLUGIN_BINARY_NAME: &str = "buzz-mesh-relay-plugin";
+
+/// Render the `[[plugin]]` TOML block mesh-llm's embedded config loader reads
+/// to spawn the relay plugin. Pure and separately testable so a regression
+/// can never make it start embedding the raw API key here — the key only
+/// ever reaches the plugin process via the `--api-key-file` argument, read
+/// from a file Buzz writes with owner-only permissions.
+fn render_relay_plugin_toml(binary: &Path, args: &[String], upstream_url: &str) -> String {
+    let mut toml = String::new();
+    toml.push_str("[[plugin]]\n");
+    toml.push_str("name = \"buzz-mesh-relay\"\n");
+    toml.push_str(&format!("command = {:?}\n", binary.display().to_string()));
+    if !args.is_empty() {
+        let quoted: Vec<String> = args.iter().map(|arg| format!("{arg:?}")).collect();
+        toml.push_str(&format!("args = [{}]\n", quoted.join(", ")));
+    }
+    toml.push_str(&format!("url = {upstream_url:?}\n"));
+    toml
+}
+
+/// Build the plugin config Buzz's embedded mesh node loads (via
+/// `EmbeddedServeConfig::config_path`) to relay serving traffic to an
+/// external OpenAI-compatible server instead of running a local model.
+///
+/// The API key, when supplied, is written to a fixed, owner-only-permissioned
+/// file next to the generated config — never inline in the TOML itself — and
+/// its path is passed to the plugin as `--api-key-file`, since mesh-llm's
+/// plugin config has no generic env-passthrough channel to the child process
+/// (only `command`/`args` reach it) and a bare CLI value would show up in
+/// `ps`/`/proc/<pid>/cmdline`.
+///
+/// That same file doubles as this feature's durable secret storage: passing
+/// `api_key: None` (the restore-on-relaunch path, where the frontend isn't
+/// present to resupply it) reuses whichever key was written by the most
+/// recent fresh start, rather than requiring a separate keyring integration
+/// purely to persist one filesystem-backed secret across restarts. Restoring
+/// with no prior key on disk is an error — the caller should surface that as
+/// "re-enter the relay API key."
+///
+/// `app_data_dir` is supplied by the caller (which holds the `AppHandle`
+/// needed to resolve it) rather than resolved here, keeping this module free
+/// of a direct Tauri dependency.
+pub fn prepare_relay_plugin_config(
+    app_data_dir: &Path,
+    upstream_url: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    let upstream_url = upstream_url.trim();
+    anyhow::ensure!(!upstream_url.is_empty(), "relay upstream URL is required");
+
+    let relay_dir = app_data_dir.join("mesh-relay");
+    std::fs::create_dir_all(&relay_dir)
+        .map_err(|error| anyhow::anyhow!("creating {}: {error}", relay_dir.display()))?;
+
+    let plugin_binary = crate::managed_agents::resolve_command(RELAY_PLUGIN_BINARY_NAME)
+        .ok_or_else(|| anyhow::anyhow!("{RELAY_PLUGIN_BINARY_NAME} binary not found"))?;
+
+    let key_path = relay_dir.join("api-key");
+    let mut args = Vec::new();
+    match api_key.map(str::trim).filter(|key| !key.is_empty()) {
+        Some(key) => {
+            crate::managed_agents::atomic_write_json_restricted(&key_path, key.as_bytes())
+                .map_err(|error| anyhow::anyhow!("writing relay api key file: {error}"))?;
+            args.push("--api-key-file".to_string());
+            args.push(key_path.display().to_string());
+        }
+        None if key_path.is_file() => {
+            args.push("--api-key-file".to_string());
+            args.push(key_path.display().to_string());
+        }
+        None => {
+            // No key supplied and none from a previous run — proceed
+            // unauthenticated rather than fail: some relay targets (a local,
+            // unprotected OpenAI-compatible server) genuinely have no key.
+        }
+    }
+
+    let config_toml = render_relay_plugin_toml(&plugin_binary, &args, upstream_url);
+    let config_path = relay_dir.join("plugin-config.toml");
+    std::fs::write(&config_path, config_toml)
+        .map_err(|error| anyhow::anyhow!("writing {}: {error}", config_path.display()))?;
+    Ok(config_path)
+}
+
+/// Where a `Serve`-mode node's model comes from: either an already-prepared
+/// relay plugin config (built via [`prepare_relay_plugin_config`]), which
+/// takes the place of a local model entirely, or a local model id that must
+/// be downloaded and passed to `.model(...)`.
+#[derive(Debug)]
+enum ServeModelSource<'a> {
+    RelayPlugin(&'a Path),
+    LocalModel(&'a str),
+}
+
+/// Pure decision extracted from `DesktopMeshRuntime::start` for testability:
+/// relay mode (an already-prepared plugin config) always wins when present,
+/// otherwise a non-empty local model id is required — matching the original
+/// "modelId is required for serve mode" behavior for non-relay requests.
+fn serve_model_source<'a>(
+    model_id: Option<&'a str>,
+    relay_plugin_config_path: Option<&'a Path>,
+) -> anyhow::Result<ServeModelSource<'a>> {
+    if let Some(config_path) = relay_plugin_config_path {
+        return Ok(ServeModelSource::RelayPlugin(config_path));
+    }
+    model_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ServeModelSource::LocalModel)
+        .ok_or_else(|| anyhow::anyhow!("modelId is required for serve mode"))
+}
+
 /// Pre-download the model (with byte progress through the output sink)
 /// before the node starts. Without this the download happens *inside*
 /// `serve::start()` where the UI can only show a frozen "starting…" state.
@@ -357,11 +492,7 @@ impl DesktopMeshRuntime {
         let console_port = mesh_console_port()?;
         let handle = match request.mode {
             MeshNodeMode::Serve => {
-                let model = model_id
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("modelId is required for serve mode"))?;
                 let mut builder = serve::EmbeddedServeConfig::builder()
-                    .model(model)
                     .api_port(api_port)
                     .console_port(console_port)
                     // No-leak invariants: never publish mesh presence, never
@@ -373,6 +504,17 @@ impl DesktopMeshRuntime {
                     .discovery_mode(MeshDiscoveryMode::Nostr)
                     .startup_timeout(MESH_STARTUP_TIMEOUT)
                     .console_ui(true);
+                match serve_model_source(
+                    model_id.as_deref(),
+                    request.relay_plugin_config_path.as_deref(),
+                )? {
+                    ServeModelSource::RelayPlugin(config_path) => {
+                        builder = builder.config_path(config_path.to_path_buf());
+                    }
+                    ServeModelSource::LocalModel(model) => {
+                        builder = builder.model(model.to_string());
+                    }
+                }
                 if let Some(mesh_name) = request.mesh_name.as_deref() {
                     builder = builder.mesh_name(mesh_name);
                 }

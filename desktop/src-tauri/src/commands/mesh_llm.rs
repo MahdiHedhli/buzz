@@ -20,6 +20,12 @@ struct MeshSharingConfig {
     /// configs predate community binding and restore against the active relay.
     #[serde(default)]
     relay_url: Option<String>,
+    /// External OpenAI-compatible server this node relays to instead of
+    /// serving a local model. The API key is never stored here — it lives in
+    /// the 0o600 file `prepare_relay_plugin_config` writes, which also serves
+    /// as this feature's durable secret storage across restarts.
+    #[serde(default)]
+    relay_upstream_url: Option<String>,
 }
 
 fn pending_new_start_checkpoint(config: &MeshSharingConfig) -> MeshSharingConfig {
@@ -104,18 +110,31 @@ fn mesh_start_plan(
 fn sharing_config_from_request(
     request: &mesh_llm::StartMeshNodeRequest,
 ) -> CmdResult<MeshSharingConfig> {
-    let model_id = request
-        .model_id
+    let relay_upstream_url = request
+        .relay_upstream_url
         .as_deref()
         .map(str::trim)
-        .filter(|model_id| !model_id.is_empty())
-        .ok_or_else(|| "modelId is required for serve mode".to_string())?;
+        .filter(|url| !url.is_empty());
+    let model_id = if relay_upstream_url.is_some() {
+        // Relay mode serves whatever the external server has loaded — there
+        // is no single local model id to require or persist.
+        String::new()
+    } else {
+        request
+            .model_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|model_id| !model_id.is_empty())
+            .ok_or_else(|| "modelId is required for serve mode".to_string())?
+            .to_string()
+    };
     Ok(MeshSharingConfig {
         enabled: true,
         start_on_next_launch: false,
-        model_id: model_id.to_string(),
+        model_id,
         max_vram_gb: request.max_vram_gb,
         relay_url: request.relay_url.clone(),
+        relay_upstream_url: relay_upstream_url.map(str::to_string),
     })
 }
 
@@ -340,7 +359,13 @@ pub(crate) async fn restore_mesh_sharing(app: &AppHandle, state: &AppState) -> C
     let Some(mut config) = load_mesh_sharing_config(app)? else {
         return Ok(());
     };
-    if (!config.enabled && !config.start_on_next_launch) || config.model_id.trim().is_empty() {
+    let has_relay_target = config
+        .relay_upstream_url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty());
+    if (!config.enabled && !config.start_on_next_launch)
+        || (config.model_id.trim().is_empty() && !has_relay_target)
+    {
         return Ok(());
     }
     config.model_id = mesh_llm::canonical_curated_model_id(&config.model_id).to_string();
@@ -365,14 +390,36 @@ pub(crate) async fn restore_mesh_sharing(app: &AppHandle, state: &AppState) -> C
     // This is restoration of a previously inference-ready serving node. Keep
     // the enabled checkpoint armed while restoring so a transient startup
     // failure does not silently turn Share Compute off.
+    let relay_plugin_config_path = match config.relay_upstream_url.as_deref() {
+        Some(upstream_url) if !upstream_url.trim().is_empty() => {
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|error| format!("failed to resolve app data dir: {error}"))?;
+            // No API key supplied here — the frontend isn't present on
+            // restore. `prepare_relay_plugin_config` reuses whichever key
+            // file the most recent fresh start wrote, or proceeds
+            // unauthenticated if none exists.
+            Some(
+                mesh_llm::prepare_relay_plugin_config(&app_data_dir, upstream_url, None)
+                    .map_err(|error| format!("failed to prepare relay plugin config: {error:#}"))?,
+            )
+        }
+        _ => None,
+    };
     let request = mesh_llm::StartMeshNodeRequest {
         mode: mesh_llm::MeshNodeMode::Serve,
-        model_id: Some(config.model_id.clone()),
+        model_id: relay_plugin_config_path
+            .is_none()
+            .then(|| config.model_id.clone()),
         max_vram_gb: config.max_vram_gb,
         join_token,
         mesh_name: Some(buzz_mesh_name_for_relay(&relay_url)),
         relay_url: Some(relay_url),
         trusted_owner_ids: Some(trusted_owner_ids),
+        relay_upstream_url: config.relay_upstream_url.clone(),
+        relay_api_key: None,
+        relay_plugin_config_path,
     };
     let started = mesh_llm::DesktopMeshRuntime::start(request)
         .await
@@ -391,11 +438,17 @@ pub(crate) async fn restore_mesh_sharing(app: &AppHandle, state: &AppState) -> C
     config.start_on_next_launch = false;
     save_mesh_sharing_config(app, &config)?;
     drop(runtime);
-    if let Err(error) = wait_for_mesh_inference(&config.model_id).await {
-        eprintln!(
-            "buzz-mesh: restored node is not inference-ready yet ({error}); \
-             leaving it to warm up without tearing it down"
-        );
+    // Relay mode has no single known-in-advance model id to probe — the
+    // relayed server's models are discovered after the plugin's health probe
+    // runs, so skip the readiness wait rather than spend it polling an empty
+    // model name.
+    if !config.model_id.trim().is_empty() {
+        if let Err(error) = wait_for_mesh_inference(&config.model_id).await {
+            eprintln!(
+                "buzz-mesh: restored node is not inference-ready yet ({error}); \
+                 leaving it to warm up without tearing it down"
+            );
+        }
     }
     mesh_llm::publish_current_status_once(app, "restore").await;
     Ok(())
@@ -413,7 +466,27 @@ pub async fn mesh_start_node(
         *model_id = mesh_llm::canonical_curated_model_id(model_id).to_string();
     }
     let sharing_config = if request.mode == mesh_llm::MeshNodeMode::Serve {
-        Some(sharing_config_from_request(&request)?)
+        let config = sharing_config_from_request(&request)?;
+        if let Some(upstream_url) = request
+            .relay_upstream_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|error| format!("failed to resolve app data dir: {error}"))?;
+            request.relay_plugin_config_path = Some(
+                mesh_llm::prepare_relay_plugin_config(
+                    &app_data_dir,
+                    upstream_url,
+                    request.relay_api_key.as_deref(),
+                )
+                .map_err(|error| format!("failed to prepare relay plugin config: {error:#}"))?,
+            );
+        }
+        Some(config)
     } else {
         None
     };
@@ -726,6 +799,9 @@ pub(crate) async fn ensure_client_node_for_model(
         mesh_name: Some(buzz_mesh_name(state)),
         relay_url: Some(relay::relay_ws_url_with_override(state)),
         trusted_owner_ids: Some(resolve_trusted_owner_ids_or_self_only(state).await),
+        relay_upstream_url: None,
+        relay_api_key: None,
+        relay_plugin_config_path: None,
     };
     let mut runtime = state.mesh_llm_runtime.lock().await;
     if let Some(existing) = runtime.as_ref() {
@@ -934,6 +1010,7 @@ pub async fn mesh_stop_node(
             model_id: String::new(),
             max_vram_gb: None,
             relay_url: None,
+            relay_upstream_url: None,
         },
     )?;
     mesh_llm::publish_stopped_status_once_at(&app, bound_relay_url.as_deref(), "stop").await;

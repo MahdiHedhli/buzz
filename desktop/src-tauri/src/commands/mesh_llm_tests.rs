@@ -120,6 +120,9 @@ fn sharing_config_keeps_the_community_where_sharing_was_enabled() {
         mesh_name: Some("buzz-community-test".to_string()),
         relay_url: Some("wss://community.example".to_string()),
         trusted_owner_ids: Some(Vec::new()),
+        relay_upstream_url: None,
+        relay_api_key: None,
+        relay_plugin_config_path: None,
     };
 
     let config = sharing_config_from_request(&request).expect("valid sharing config");
@@ -147,6 +150,7 @@ fn new_start_checkpoint_prevents_incomplete_download_restore() {
         model_id: "test-model".to_string(),
         max_vram_gb: Some(24),
         relay_url: Some("wss://community.example".to_string()),
+        relay_upstream_url: None,
     };
 
     let checkpoint = pending_new_start_checkpoint(&config);
@@ -165,6 +169,7 @@ fn role_switch_checkpoint_starts_exactly_once_after_restart() {
         model_id: "test-model".to_string(),
         max_vram_gb: Some(24),
         relay_url: Some("wss://community.example".to_string()),
+        relay_upstream_url: None,
     };
 
     let restart = one_shot_restart_checkpoint(&config);
@@ -415,6 +420,9 @@ fn ensure_serve_runtime_serves_other_model() {
                         mesh_name: None,
                         relay_url: None,
                         trusted_owner_ids: None,
+                        relay_upstream_url: None,
+                        relay_api_key: None,
+                        relay_plugin_config_path: None,
                     })
                     .await
                     .expect("serve runtime should start");

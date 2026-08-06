@@ -14,6 +14,9 @@ fn pending_client_runtime(
         mesh_name: None,
         relay_url: None,
         trusted_owner_ids: None,
+        relay_upstream_url: None,
+        relay_api_key: None,
+        relay_plugin_config_path: None,
     };
     super::DesktopMeshRuntime {
         id: 7,
@@ -723,4 +726,111 @@ fn serving_usage_defaults_to_zero_on_missing_fields() {
     let usage = super::serving_usage_from_payload(&json!({}));
     assert_eq!(usage, super::MeshServingUsage::default());
     assert_eq!(usage.remote_attempts + usage.endpoint_attempts, 0);
+}
+
+// ── Relay mode: plugin config generation and the "has a model" gate ────────
+
+#[test]
+fn relay_plugin_toml_never_embeds_the_raw_api_key() {
+    // The only thing that should ever carry the key is the file path passed
+    // via --api-key-file; the security property this whole feature depends
+    // on is that the key itself never lands in the config Buzz writes.
+    let toml = super::render_relay_plugin_toml(
+        std::path::Path::new("/opt/buzz/bin/buzz-mesh-relay-plugin"),
+        &[
+            "--api-key-file".to_string(),
+            "/home/codex/.local/share/buzz/mesh-relay/api-key".to_string(),
+        ],
+        "https://100.114.85.122:1234/v1",
+    );
+    assert!(
+        !toml.contains("sk-"),
+        "toml must never embed a raw key: {toml}"
+    );
+    assert!(toml.contains("buzz-mesh-relay-plugin"));
+    assert!(toml.contains("--api-key-file"));
+    assert!(toml.contains("mesh-relay/api-key"));
+    assert!(toml.contains("https://100.114.85.122:1234/v1"));
+}
+
+#[test]
+fn relay_plugin_toml_with_no_key_omits_args() {
+    let toml = super::render_relay_plugin_toml(
+        std::path::Path::new("/opt/buzz/bin/buzz-mesh-relay-plugin"),
+        &[],
+        "http://localhost:1234/v1",
+    );
+    assert!(!toml.contains("args"));
+    assert!(toml.contains("http://localhost:1234/v1"));
+}
+
+#[test]
+fn serve_model_source_prefers_relay_plugin_over_local_model() {
+    let path = std::path::PathBuf::from("/tmp/plugin-config.toml");
+    let source = super::serve_model_source(Some("some-local-model"), Some(&path))
+        .expect("relay plugin config always satisfies the model requirement");
+    match source {
+        super::ServeModelSource::RelayPlugin(resolved) => assert_eq!(resolved, path),
+        super::ServeModelSource::LocalModel(_) => panic!("expected relay plugin source"),
+    }
+}
+
+#[test]
+fn serve_model_source_requires_local_model_id_without_relay_plugin() {
+    let source = super::serve_model_source(Some("Qwen3-8B-Q4_K_M"), None)
+        .expect("non-empty model id satisfies the requirement");
+    match source {
+        super::ServeModelSource::LocalModel(model) => assert_eq!(model, "Qwen3-8B-Q4_K_M"),
+        super::ServeModelSource::RelayPlugin(_) => panic!("expected local model source"),
+    }
+}
+
+#[test]
+fn serve_model_source_errors_without_model_id_or_relay_plugin() {
+    let error = super::serve_model_source(None, None).unwrap_err();
+    assert!(error.to_string().contains("modelId is required"));
+
+    // Matches the pre-existing behavior: a blank string is not a real model id.
+    let error = super::serve_model_source(Some("   "), None).unwrap_err();
+    assert!(error.to_string().contains("modelId is required"));
+}
+
+#[test]
+fn prepare_relay_plugin_config_rejects_blank_upstream_url() {
+    let dir = tempfile_dir();
+    let error =
+        super::prepare_relay_plugin_config(dir.path(), "   ", Some("some-key")).unwrap_err();
+    assert!(error.to_string().contains("relay upstream URL is required"));
+}
+
+/// Minimal temp-dir helper — this crate does not otherwise depend on
+/// `tempfile` for lib code, so avoid adding it as a dependency just for one
+/// test by using a uniquely-named directory under the OS temp dir.
+fn tempfile_dir() -> TempDir {
+    let path = std::env::temp_dir().join(format!(
+        "buzz-mesh-relay-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&path).expect("create temp dir");
+    TempDir { path }
+}
+
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
