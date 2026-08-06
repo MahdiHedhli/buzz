@@ -22,6 +22,13 @@ export type StartMeshNodeRequest = {
   modelId?: string;
   maxVramGb?: number;
   joinToken?: string;
+  /** An already-running external OpenAI-compatible server to relay serving
+   * traffic to instead of downloading and running a local model. */
+  relayUpstreamUrl?: string;
+  /** Bearer key for `relayUpstreamUrl`. Sent once on a fresh start; the
+   * backend persists it (never inline in the sharing config) and reuses it
+   * on restore, so it does not need to be resupplied afterward. */
+  relayApiKey?: string;
 };
 
 export type MeshNodeStatus = {
