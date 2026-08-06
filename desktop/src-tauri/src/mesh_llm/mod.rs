@@ -335,6 +335,12 @@ pub const MESH_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// falling back to PATH in dev).
 const RELAY_PLUGIN_BINARY_NAME: &str = "buzz-mesh-relay-plugin";
 
+/// Plugin identity declared in the generated config's `name` field. Must
+/// match `PLUGIN_ID` in `crates/buzz-mesh-relay-plugin/src/lib.rs` exactly —
+/// mesh-llm's host runtime verifies the plugin process's self-reported
+/// handshake identity against this configured name and rejects a mismatch.
+const RELAY_PLUGIN_ID: &str = "buzz-mesh-relay";
+
 /// Render the `[[plugin]]` TOML block mesh-llm's embedded config loader reads
 /// to spawn the relay plugin. Pure and separately testable so a regression
 /// can never make it start embedding the raw API key here — the key only
@@ -342,8 +348,19 @@ const RELAY_PLUGIN_BINARY_NAME: &str = "buzz-mesh-relay-plugin";
 /// from a file Buzz writes with owner-only permissions.
 fn render_relay_plugin_toml(binary: &Path, args: &[String], upstream_url: &str) -> String {
     let mut toml = String::new();
+    // Mirrors mesh-llm-host-runtime's own `prepare_isolated_config` default
+    // (sdk.rs) — Buzz's no-leak invariants keep these disabled unconditionally
+    // regardless of serve mode. A config_path is otherwise a *replacement* for
+    // that isolated default, not an addition to it, so this custom config
+    // must restate the same disables or relay mode would silently re-enable
+    // them.
+    toml.push_str("[[plugin]]\nname = \"telemetry\"\nenabled = false\n\n");
+    toml.push_str("[[plugin]]\nname = \"blobstore\"\nenabled = false\n\n");
     toml.push_str("[[plugin]]\n");
-    toml.push_str("name = \"buzz-mesh-relay\"\n");
+    // Must match the plugin binary's own self-reported identity — mesh-llm's
+    // host runtime rejects a plugin whose handshake name doesn't match this
+    // configured name.
+    toml.push_str(&format!("name = {RELAY_PLUGIN_ID:?}\n"));
     toml.push_str(&format!("command = {:?}\n", binary.display().to_string()));
     if !args.is_empty() {
         let quoted: Vec<String> = args.iter().map(|arg| format!("{arg:?}")).collect();

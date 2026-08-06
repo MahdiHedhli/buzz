@@ -4,8 +4,12 @@
 //! built from that separate repo — because Buzz's release pipeline
 //! (`scripts/bundle-sidecars.sh`) only builds first-party workspace crates
 //! via `cargo build --release -p <crate>`, the same way it builds the
-//! `buzz-acp`/`buzz-agent` sidecars. Keep this in sync with the fork; the
-//! fork is the canonical source for the upstream contribution.
+//! `buzz-acp`/`buzz-agent` sidecars. Keep this in sync with the fork, with
+//! ONE deliberate exception: `PLUGIN_ID` here is Buzz-specific
+//! (`RELAY_PLUGIN_ID` in `desktop/src-tauri/src/mesh_llm/mod.rs` must match
+//! it exactly — mesh-llm's host runtime rejects a plugin whose handshake
+//! identity doesn't match its configured name). The fork keeps the generic
+//! `"openai-endpoint"` id since it isn't Buzz-specific.
 
 use anyhow::{Context, Result};
 use axum::{
@@ -25,7 +29,7 @@ use tokio::net::TcpListener;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
-const PLUGIN_ID: &str = "openai-endpoint";
+const PLUGIN_ID: &str = "buzz-mesh-relay";
 
 fn upstream_base_url() -> String {
     std::env::var("MESH_LLM_PLUGIN_URL")
