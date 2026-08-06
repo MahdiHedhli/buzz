@@ -41,6 +41,16 @@ import { deriveServingIndicator } from "../servingUsage";
 
 const MODEL_DRAFT_STORAGE_KEY = "buzz.mesh-compute.share.model.v1";
 const MAX_VRAM_DRAFT_STORAGE_KEY = "buzz.mesh-compute.share.max-vram-gb.v1";
+const RELAY_MODE_DRAFT_STORAGE_KEY = "buzz.mesh-compute.share.relay-mode.v1";
+const RELAY_URL_DRAFT_STORAGE_KEY = "buzz.mesh-compute.share.relay-url.v1";
+// Deliberately NOT persisted: the relay API key is a secret. The backend
+// stores it (never inline in the sharing config) and reuses it across
+// restarts, so the field only needs a fresh value on the very first start or
+// when rotating the key — see the "leave blank to keep" placeholder below.
+
+const SERVE_MODE_LOCAL = "local";
+const SERVE_MODE_RELAY = "relay";
+type ServeSourceMode = typeof SERVE_MODE_LOCAL | typeof SERVE_MODE_RELAY;
 
 // Keep the Share compute controls visually and behaviorally aligned with the
 // agent configuration fields. This is intentionally the same shell used by
@@ -96,6 +106,16 @@ export function MeshComputeSettingsCard() {
   const [maxVramGb, setMaxVramGb] = React.useState<string>(() =>
     readDraft(MAX_VRAM_DRAFT_STORAGE_KEY),
   );
+  const [serveMode, setServeMode] = React.useState<ServeSourceMode>(() =>
+    readDraft(RELAY_MODE_DRAFT_STORAGE_KEY) === SERVE_MODE_RELAY
+      ? SERVE_MODE_RELAY
+      : SERVE_MODE_LOCAL,
+  );
+  const [relayUrl, setRelayUrl] = React.useState(() =>
+    readDraft(RELAY_URL_DRAFT_STORAGE_KEY),
+  );
+  const [relayApiKey, setRelayApiKey] = React.useState("");
+  const isRelayMode = serveMode === SERVE_MODE_RELAY;
   const [isCustomModelEditing, setIsCustomModelEditing] = React.useState(false);
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
   const [actionInFlight, setActionInFlight] = React.useState(false);
@@ -184,7 +204,9 @@ export function MeshComputeSettingsCard() {
   // occupants remain locked until stopped/recovered.
   const controlsDisabled = actionInFlight || (slotOccupied && !isConsuming);
   const refClass = classifyModelRef(modelInput);
-  const canStart = refClass.kind !== "unknown" && !actionInFlight;
+  const canStart = isRelayMode
+    ? relayUrl.trim() !== "" && !actionInFlight
+    : refClass.kind !== "unknown" && !actionInFlight;
   const showSharingControls = isSharing || pendingAction === "start";
 
   async function handleToggle(next: boolean) {
@@ -204,11 +226,17 @@ export function MeshComputeSettingsCard() {
           maxVramGb.trim() === "" ? undefined : Number.parseFloat(maxVramGb);
         await meshStartNode({
           mode: "serve",
-          modelId: modelInput.trim() || undefined,
+          modelId: isRelayMode ? undefined : modelInput.trim() || undefined,
           maxVramGb:
             typeof maxVram === "number" && !Number.isNaN(maxVram)
               ? maxVram
               : undefined,
+          relayUpstreamUrl: isRelayMode
+            ? relayUrl.trim() || undefined
+            : undefined,
+          relayApiKey: isRelayMode
+            ? relayApiKey.trim() || undefined
+            : undefined,
         });
       } else {
         await meshStopNode();
@@ -280,18 +308,60 @@ export function MeshComputeSettingsCard() {
           />
         </div>
 
-        <MeshModelPicker
-          catalog={catalog}
-          disabled={controlsDisabled}
-          installedModels={installedModels}
-          isCustomModelEditing={isCustomModelEditing}
-          model={modelInput}
-          onCustomModelEditingChange={setIsCustomModelEditing}
-          onModelChange={(next) => {
-            setModelInput(next);
-            writeDraft(MODEL_DRAFT_STORAGE_KEY, next);
-          }}
-        />
+        <div className="space-y-1.5" data-testid="mesh-share-compute-source">
+          <label
+            className="text-sm font-medium"
+            htmlFor="mesh-share-compute-source-mode"
+          >
+            Source
+          </label>
+          <AgentDropdownSelect
+            className={MESH_SELECT_TRIGGER_CLASS}
+            disabled={controlsDisabled}
+            id="mesh-share-compute-source-mode"
+            onValueChange={(next) => {
+              const mode =
+                next === SERVE_MODE_RELAY ? SERVE_MODE_RELAY : SERVE_MODE_LOCAL;
+              setServeMode(mode);
+              writeDraft(RELAY_MODE_DRAFT_STORAGE_KEY, mode);
+            }}
+            options={[
+              { label: "Serve a local model", value: SERVE_MODE_LOCAL },
+              {
+                label: "Relay to an external server",
+                value: SERVE_MODE_RELAY,
+              },
+            ]}
+            testId="mesh-share-compute-source-mode"
+            value={serveMode}
+          />
+        </div>
+
+        {isRelayMode ? (
+          <MeshRelayFields
+            apiKey={relayApiKey}
+            disabled={controlsDisabled}
+            onApiKeyChange={setRelayApiKey}
+            onUrlChange={(next) => {
+              setRelayUrl(next);
+              writeDraft(RELAY_URL_DRAFT_STORAGE_KEY, next);
+            }}
+            url={relayUrl}
+          />
+        ) : (
+          <MeshModelPicker
+            catalog={catalog}
+            disabled={controlsDisabled}
+            installedModels={installedModels}
+            isCustomModelEditing={isCustomModelEditing}
+            model={modelInput}
+            onCustomModelEditingChange={setIsCustomModelEditing}
+            onModelChange={(next) => {
+              setModelInput(next);
+              writeDraft(MODEL_DRAFT_STORAGE_KEY, next);
+            }}
+          />
+        )}
 
         <div className="pt-3">
           <button
@@ -577,6 +647,74 @@ function MeshModelPicker({
           : "Choose a model or enter a model reference or local file."}{" "}
         Buzz downloads remote models when sharing starts.
       </p>
+    </div>
+  );
+}
+
+/**
+ * Relay mode's fields: the external server's URL and, optionally, a bearer
+ * API key. No model field — the relayed server's own models are discovered
+ * automatically once sharing starts, so there's nothing to select here.
+ */
+function MeshRelayFields({
+  apiKey,
+  disabled,
+  onApiKeyChange,
+  onUrlChange,
+  url,
+}: {
+  apiKey: string;
+  disabled: boolean;
+  onApiKeyChange: (value: string) => void;
+  onUrlChange: (value: string) => void;
+  url: string;
+}) {
+  return (
+    <div className="space-y-3" data-testid="mesh-share-compute-relay">
+      <div className="space-y-1.5">
+        <label
+          className="text-sm font-medium"
+          htmlFor="mesh-share-compute-relay-url"
+        >
+          Server URL
+        </label>
+        <AgentConfigTextInput
+          autoCorrect="off"
+          disabled={disabled}
+          id="mesh-share-compute-relay-url"
+          onChange={(event) => onUrlChange(event.target.value)}
+          placeholder="https://100.x.y.z:1234/v1"
+          usePersonaInputStyle
+          value={url}
+        />
+        <p className="text-sm font-normal text-muted-foreground">
+          An already-running OpenAI-compatible server (e.g. LM Studio). Whatever
+          models it has loaded become available to the pool — Buzz downloads
+          nothing in this mode.
+        </p>
+      </div>
+      <div className="space-y-1.5">
+        <label
+          className="text-sm font-medium"
+          htmlFor="mesh-share-compute-relay-key"
+        >
+          API key
+        </label>
+        <AgentConfigTextInput
+          autoCorrect="off"
+          disabled={disabled}
+          id="mesh-share-compute-relay-key"
+          onChange={(event) => onApiKeyChange(event.target.value)}
+          placeholder="Leave blank to keep the previously saved key"
+          type="password"
+          usePersonaInputStyle
+          value={apiKey}
+        />
+        <p className="text-sm font-normal text-muted-foreground">
+          Stored securely and reused on restart — you only need to re-enter it
+          to change it.
+        </p>
+      </div>
     </div>
   );
 }
